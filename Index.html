@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>The Cellar — House Inventory</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Work+Sans:wght@400;500;600;700;800&family=Bebas+Neue&family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&display=swap" rel="stylesheet">
+
+<!-- Firebase SDKs -->
+<script type="module">
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
+import { getFirestore, collection, doc, onSnapshot, addDoc, updateDoc, deleteDoc, setDoc, query, getDocs } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+
+const firebaseConfig = {
+  apiKey: "AIzaSyC9TQc6D4gTKIrnS18WLylZMJGyvUWx5C0",
+  authDomain: "the-cellar-898ca.firebaseapp.com",
+  projectId: "the-cellar-898ca",
+  storageBucket: "the-cellar-898ca.firebasestorage.app",
+  messagingSenderId: "563417876719",
+  appId: "1:563417876719:web:c6e5dd74b017311e8fb31a"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+
+// ─── State ───────────────────────────────────────────────────────
+let locations = [];
+let products = [];
+let stock = [];
+
+let filter = 'all';
+let search = '';
+let activeModal = null;
+let modalData = {};
+let scannerInstance = null;
+let scannerActive = false;
+let barcodeFoundName = '';
+let barcodeFoundImage = '';
+let barcodeValue = '';
+
+// ─── Firestore listeners ──────────────────────────────────────────
+onSnapshot(collection(db, 'locations'), snap => {
+  locations = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  render();
+});
+onSnapshot(collection(db, 'products'), snap => {
+  products = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  render();
+});
+onSnapshot(collection(db, 'stock'), snap => {
+  stock = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  render();
+});
+
+// ─── Firestore actions ────────────────────────────────────────────
+async function addLocation(name, isCold) {
+  await addDoc(collection(db, 'locations'), { name, isCold });
+}
+
+async function deleteLocation(locId) {
+  await deleteDoc(doc(db, 'locations', locId));
+  // delete all stock entries at this location
+  const affected = stock.filter(s => s.locationId === locId);
+  await Promise.all(affected.map(s => deleteDoc(doc(db, 'stock', s.id))));
+}
+
+async function addProduct(name, type, imageUrl, barcode) {
+  const ref = await addDoc(collection(db, 'products'), { name, type, imageUrl: imageUrl || null, barcode: barcode || null });
+  return ref.id;
+}
+
+async function deleteProduct(productId) {
+  await deleteDoc(doc(db, 'products', productId));
+  const affected = stock.filter(s => s.productId === productId);
+  await Promise.all(affected.map(s => deleteDoc(doc(db, 'stock', s.id))));
+}
+
+async function addStock(productId, locationId, quantity) {
+  const existing = stock.find(s => s.productId === productId && s.locationId === locationId);
+  if (existing) {
+    await updateDoc(doc(db, 'stock', existing.id), { quantity: existing.quantity + quantity });
+  } else {
+    await addDoc(collection(db, 'stock'), { productId, locationId, quantity });
+  }
+}
+
+async function changeStock(stockId, delta) {
+  const s = stock.find(x => x.id === stockId);
+  if (!s) return;
+  const newQty = s.quantity + delta;
+  if (newQty <= 0) {
+    await deleteDoc(doc(db, 'stock', stockId));
+  } else {
+    await updateDoc(doc(db, 'stock', stockId), { quantity: newQty });
+  }
+}
+
+async function moveStock(stockId, toLocationId, amount) {
+  const s = stock.find(x => x.id === stockId);
+  if (!s) return;
+  const newQty = s.quantity - amount;
+  if (newQty <= 0) {
+    await deleteDoc(doc(db, 'stock', stockId));
+  } else {
+    await updateDoc(doc(db, 'stock', stockId), { quantity: newQty });
+  }
+  await addStock(s.productId, toLocationId, amount);
+}
+
+// ─── Computed helpers ─────────────────────────────────────────────
+function getStockForProduct(productId) {
+  return stock.filter(s => s.productId === productId);
+}
+
+function totalForProduct(productId) {
+  return getStockForProduct(productId).reduce((sum, s) => sum + s.quantity, 0);
+}
+
+function totalAll() {
+  return stock.reduce((sum, s) => sum + s.quantity, 0);
+}
+
+function coldLocIds() { return locations.filter(l => l.isCold).map(l => l.id); }
+function warmLocIds() { return locations.filter(l => !l.isCold).map(l => l.id); }
+
+function filteredProducts() {
+  const q = search.toLowerCase();
+  return products.filter(p => {
+    if (q && !p.name.toLowerCase().includes(q)) return false;
+    const ps = getStockForProduct(p.id);
+    if (filter === 'cold') return ps.some(s => coldLocIds().includes(s.locationId));
+    if (filter === 'storage') return ps.some(s => warmLocIds().includes(s.locationId));
+    return ps.length > 0;
+  });
+}
+
+function visibleStock(productId) {
+  const ps = getStockForProduct(productId);
+  if (filter === 'cold') return ps.filter(s => coldLocIds().includes(s.locationId));
+  if (filter === 'storage') return ps.filter(s => warmLocIds().includes(s.locationId));
+  return ps;
+}
+
+function locName(id) { return locations.find(l => l.id === id)?.name || '?'; }
+function locIsCold(id) { return locations.find(l => l.id === id)?.isCold || false; }
+function stockAtLoc(locId) { return stock.filter(s => s.locationId === locId).reduce((sum, s) => sum + s.quantity, 0); }
+function stockAffectedByLocDelete(locId) { return stock.filter(s => s.locationId === locId).reduce((sum, s) => sum + s.quantity, 0); }
+
+// ─── UPCitemdb barcode lookup ─────────────────────────────────────
+async function lookupBarcode(code) {
+  try {
+    const res = await fetch(`https://api.upcitemdb.com/prod/trial/lookup?upc=${code}`);
+    const data = await res.json();
+    if (data.items && data.items.length > 0) {
+      const item = data.items[0];
+      return { name: item.title || '', image: item.images?.[0] || '' };
+    }
+  } catch(e) {}
+  return null;
+}
+
+// ─── Scanner ──────────────────────────────────────────────────────
+function startScanner() {
+  const scanEl = document.getElementById('scanner-video');
+  if (!scanEl) return;
+
+  const codeReader = new ZXing.BrowserMultiFormatReader();
+  scannerInstance = codeReader;
+  scannerActive = true;
+
+  codeReader.decodeFromVideoDevice(null, 'scanner-video', async (result, err) => {
+    if (result) {
+      const code = result.getText();
+      stopScanner();
+      document.getElementById('scan-status').textContent = 'Suche Produkt…';
+      barcodeValue = code;
+      const found = await lookupBarcode(code);
+      if (found && found.name) {
+        barcodeFoundName = found.name;
+        barcodeFoundImage = found.image || '';
+        document.getElementById('add-name').value = found.name;
+        document.getElementById('barcode-display').textContent = code;
+        if (found.image) {
+          document.getElementById('preview-img').src = found.image;
+          document.getElementById('preview-img').style.display = 'block';
+          document.getElementById('preview-placeholder').style.display = 'none';
+        }
+        document.getElementById('scan-status').textContent = '✓ Produkt gefunden';
+        document.getElementById('scan-status').style.color = '#1B2A4E';
+      } else {
+        barcodeFoundName = '';
+        barcodeFoundImage = '';
+        document.getElementById('barcode-display').textContent = code;
+        document.getElementById('scan-status').textContent = 'Nicht gefunden — bitte manuell eingeben';
+        document.getElementById('scan-status').style.color = '#8B2020';
+      }
+      document.getElementById('scanner-wrap').style.display = 'none';
+      document.getElementById('scan-btn').style.display = 'inline-flex';
+    }
+  });
+
+  document.getElementById('scanner-wrap').style.display = 'block';
+  document.getElementById('scan-btn').style.display = 'none';
+  document.getElementById('scan-status').textContent = 'Kamera aktiv – Barcode einrahmen';
+  document.getElementById('scan-status').style.color = '#5C4E3F';
+}
+
+function stopScanner() {
+  if (scannerInstance) {
+    scannerInstance.reset();
+    scannerInstance = null;
+  }
+  scannerActive = false;
+  const wrap = document.getElementById('scanner-wrap');
+  const btn = document.getElementById('scan-btn');
+  if (wrap) wrap.style.display = 'none';
+  if (btn) btn.style.display = 'inline-flex';
+}
+
+// ─── Modal helpers ────────────────────────────────────────────────
+function openModal(name, data = {}) {
+  stopScanner();
+  activeModal = name;
+  modalData = data;
+  render();
+}
+
+function closeModal() {
+  stopScanner();
+  activeModal = null;
+  modalData = {};
+  barcodeFoundName = '';
+  barcodeFoundImage = '';
+  barcodeValue = '';
+  render();
+}
+
+// ─── Event bus ────────────────────────────────────────────────────
+document.addEventListener('click', async (e) => {
+  const t = e.target.closest('[data-action]');
+  if (!t) return;
+  const action = t.dataset.action;
+
+  if (action === 'close-modal') { closeModal(); return; }
+  if (action === 'open-add-location') { openModal('add-location'); return; }
+  if (action === 'open-add-product') {
+    openModal('add-product');
+    return;
+  }
+  if (action === 'open-product-detail') {
+    const pid = t.dataset.pid;
+    openModal('product-detail', { productId: pid });
+    return;
+  }
+  if (action === 'open-move') {
+    const stockId = t.dataset.sid;
+    openModal('move', { stockId });
+    return;
+  }
+  if (action === 'open-delete-location') {
+    const locId = t.dataset.lid;
+    openModal('confirm-delete-location', { locId });
+    return;
+  }
+  if (action === 'set-filter') {
+    filter = t.dataset.filter;
+    render(); return;
+  }
+  if (action === 'increment') {
+    const sid = t.dataset.sid;
+    await changeStock(sid, 1); return;
+  }
+  if (action === 'decrement') {
+    const sid = t.dataset.sid;
+    await changeStock(sid, -1); return;
+  }
+  if (action === 'confirm-add-location') {
+    const name = document.getElementById('loc-name').value.trim();
+    const isCold = document.getElementById('loc-cold').dataset.val === 'true';
+    if (!name) return;
+    await addLocation(name, isCold);
+    closeModal(); return;
+  }
+  if (action === 'toggle-cold') {
+    const el = document.getElementById('loc-cold');
+    const current = el.dataset.val === 'true';
+    el.dataset.val = !current;
+    renderToggle(el, !current); return;
+  }
+  if (action === 'start-scan') {
+    startScanner(); return;
+  }
+  if (action === 'stop-scan') {
+    stopScanner(); return;
+  }
+  if (action === 'confirm-add-product') {
+    const name = document.getElementById('add-name').value.trim();
+    const type = document.getElementById('add-type').value;
+    const locId = document.getElementById('add-loc').value;
+    const qty = parseInt(document.getElementById('add-qty').value) || 1;
+    const imgEl = document.getElementById('preview-img');
+    const imageUrl = (imgEl && imgEl.style.display !== 'none') ? imgEl.src : (barcodeFoundImage || null);
+    if (!name) return;
+    const pid = await addProduct(name, type, imageUrl, barcodeValue || null);
+    await addStock(pid, locId, qty);
+    closeModal(); return;
+  }
+  if (action === 'confirm-move') {
+    const stockId = modalData.stockId;
+    const toLocId = document.getElementById('move-to-loc').value;
+    const amount = parseInt(document.getElementById('move-amount').value) || 1;
+    await moveStock(stockId, toLocId, amount);
+    closeModal(); return;
+  }
+  if (action === 'delete-product') {
+    const pid = modalData.productId;
+    await deleteProduct(pid);
+    closeModal(); return;
+  }
+  if (action === 'confirm-delete-location') {
+    const confirmInput = document.getElementById('confirm-delete-input').value.trim().toUpperCase();
+    if (confirmInput !== 'LÖSCHEN') return;
+    await deleteLocation(modalData.locId);
+    closeModal(); return;
+  }
+  if (action === 'modal-overlay-close') {
+    const modal = document.getElementById('modal-overlay');
+    if (e.target === modal) closeModal();
+    return;
+  }
+  if (action === 'open-product-detail-from-modal') {
+    const pid = t.dataset.pid;
+    closeModal();
+    setTimeout(() => openModal('product-detail', { productId: pid }), 50);
+    return;
+  }
+});
+
+// Range + number sync for move modal
+document.addEventListener('input', (e) => {
+  if (e.target.id === 'move-amount-range') {
+    const v = parseInt(e.target.value);
+    document.getElementById('move-amount').value = v;
+  }
+  if (e.target.id === 'move-amount') {
+    const max = parseInt(document.getElementById('move-amount-range').max);
+    let v = parseInt(e.target.value.replace(/[^0-9]/g, '')) || 1;
+    v = Math.min(max, Math.max(1, v));
+    document.getElementById('move-amount-range').value = v;
+    document.getElementById('move-amount').value = v;
+  }
+  if (e.target.id === 'add-qty') {
+    let v = e.target.value.replace(/[^0-9]/g, '');
+    if (v !== '') v = Math.max(1, parseInt(v));
+    e.target.value = v;
+  }
+  if (e.target.id === 'search-input') {
+    search = e.target.value;
+    render();
+  }
+  if (e.target.id === 'confirm-delete-input') {
+    const btn = document.getElementById('confirm-delete-btn');
+    if (btn) btn.disabled = e.target.value.trim().toUpperCase() !== 'LÖSCHEN';
+  }
+});
+
+// Photo upload
+document.addEventListener('change', (e) => {
+  if (e.target.id === 'photo-upload') {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = document.getElementById('preview-img');
+      const ph = document.getElementById('preview-placeholder');
+      if (img) { img.src = reader.result; img.style.display = 'block'; }
+      if (ph) ph.style.display = 'none';
+    };
+    reader.readAsDataURL(file);
+  }
+});
+
+// ─── Render helpers ───────────────────────────────────────────────
+const C = {
+  bg: '#1A1410', paper: '#F2E8D5', paperDark: '#E5D8BB', paperDarker: '#D8C9A8',
+  ink: '#1C1814', inkSoft: '#5C4E3F', brass: '#A8842F', brassDark: '#6F5621',
+  navy: '#1B2A4E', navyDeep: '#0F1A33', danger: '#8B2020', lineSoft: '#8B7559',
+  disabled: '#B8AB8E', line: '#3A2A1E'
+};
+
+function renderToggle(el, val) {
+  el.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 16px;background:${C.paperDark};border:2px solid ${C.ink};cursor:pointer;" data-action="toggle-cold" id="loc-cold" data-val="${val}">
+      <span style="font-size:14px;font-weight:600;color:${C.ink}">Ist ein Kühlschrank</span>
+      <div style="width:44px;height:24px;background:${val ? C.navy : C.lineSoft};position:relative;transition:background 0.2s;">
+        <div style="width:18px;height:18px;background:${C.paper};position:absolute;top:3px;left:${val ? '23px' : '3px'};transition:left 0.2s;"></div>
+      </div>
+    </div>`;
+}
+
+function btnStyle(bg, color, extra = '') {
+  return `style="background:${bg};color:${color};border:none;cursor:pointer;font-family:'Work Sans',sans-serif;font-weight:700;letter-spacing:0.15em;text-transform:uppercase;font-size:12px;${extra}"`;
+}
+
+function pubBtn(action, dataset, label, ariaLabel) {
+  return `<button data-action="${action}" ${dataset} aria-label="${ariaLabel}" style="width:28px;height:28px;background:${C.paperDarker};border:1px solid ${C.brassDark};cursor:pointer;font-size:13px;font-family:'Work Sans',sans-serif;font-weight:700;color:${C.ink};display:inline-flex;align-items:center;justify-content:center;padding:0;line-height:1;flex-shrink:0;">${label}</button>`;
+}
+
+function renderStockControls(stockId) {
+  return `<div style="display:flex;align-items:center;gap:4px;flex-shrink:0;">
+    ${pubBtn('open-move', `data-sid="${stockId}"`, '→', 'Verschieben')}
+    ${pubBtn('decrement', `data-sid="${stockId}"`, '−', 'Entnehmen')}
+    ${pubBtn('increment', `data-sid="${stockId}"`, '+', 'Hinzufügen')}
+  </div>`;
+}
+
+// ─── Main render ──────────────────────────────────────────────────
+function render() {
+  const app = document.getElementById('app');
+  if (!app) return;
+
+  const fp = filteredProducts();
+  const colCount = Math.min(locations.length || 1, 3);
+
+  app.innerHTML = `
+  <style>
+    @keyframes fadeIn { from{opacity:0} to{opacity:1} }
+    @keyframes slideUp { from{transform:translateY(100%)} to{transform:translateY(0)} }
+    * { box-sizing:border-box; }
+    body { margin:0; background:${C.bg}; }
+    .display { font-family:'Bebas Neue',sans-serif; letter-spacing:0.02em; line-height:0.95; }
+    .label { font-family:'Work Sans',sans-serif; font-size:10px; font-weight:700; letter-spacing:0.22em; text-transform:uppercase; }
+    .paper-bg {
+      background-color:${C.paper};
+      background-image:
+        radial-gradient(ellipse at top left, rgba(168,132,47,0.06) 0%,transparent 50%),
+        radial-gradient(ellipse at bottom right,rgba(27,42,78,0.05) 0%,transparent 50%),
+        repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(58,42,30,0.012) 2px,rgba(58,42,30,0.012) 4px);
+    }
+    .pub-input { width:100%;padding:12px 14px;border:2px solid ${C.ink};background:${C.paper};font-size:14px;font-weight:500;color:${C.ink};font-family:'Work Sans',sans-serif;border-radius:0;outline:none; }
+    .pub-input:focus { background:#fff; }
+    .pub-input::placeholder { color:${C.lineSoft}; }
+    .fab { position:fixed;bottom:32px;right:24px;width:64px;height:64px;border-radius:50%;background:radial-gradient(circle at 30% 30%,${C.brass} 0%,${C.brassDark} 100%);color:${C.ink};border:none;font-size:36px;font-family:'Bebas Neue',sans-serif;cursor:pointer;display:flex;align-items:center;justify-content:center;z-index:50;box-shadow:0 6px 16px rgba(0,0,0,0.5),inset 0 0 0 2px ${C.brassDark}; }
+    .modal-overlay { position:fixed;inset:0;background:rgba(10,6,4,0.75);backdrop-filter:blur(6px);z-index:100;display:flex;align-items:flex-end;justify-content:center;animation:fadeIn 0.2s ease; }
+    .modal-box { background:linear-gradient(135deg,#3D2718 0%,#1A1410 100%);padding:10px;width:100%;max-width:480px;box-shadow:0 -8px 30px rgba(0,0,0,0.5);animation:slideUp 0.3s cubic-bezier(0.16,1,0.3,1);max-height:90vh;overflow-y:auto; }
+    .modal-inner { padding:24px 22px 28px; }
+    @media(min-width:720px) { .modal-overlay{align-items:center;padding:24px} .modal-box{max-width:520px} }
+    input[type=range] { accent-color:${C.navy};width:100%; }
+    video { width:100%;border:2px solid ${C.brass};display:block; }
+    select option { background:${C.paper};color:${C.ink}; }
+    .loc-card { background:${C.paperDark};padding:18px;text-align:center;min-height:130px;display:flex;flex-direction:column;justify-content:space-between;position:relative; }
+    .loc-del-btn { position:absolute;top:8px;right:8px;width:22px;height:22px;background:${C.danger};color:${C.paper};border:none;cursor:pointer;font-size:14px;font-weight:700;display:flex;align-items:center;justify-content:center;padding:0;line-height:1; }
+    .prod-row { padding:20px 0;display:flex;gap:18px;align-items:flex-start; }
+    .prod-row+.prod-row { border-top:1px dotted ${C.lineSoft}; }
+    .prod-initial { width:60px;height:72px;background:${C.navy};color:${C.paper};display:flex;align-items:center;justify-content:center;font-family:'Bebas Neue',sans-serif;font-size:44px;flex-shrink:0;border:2px solid ${C.brass};cursor:pointer;overflow:hidden; }
+    @media(max-width:400px){ .fab{bottom:20px;right:16px;} }
+  </style>
+
+  <div style="padding:20px 16px 140px;max-width:900px;margin:0 auto;">
+    <div style="background:linear-gradient(135deg,#3D2718 0%,#1A1410 100%);box-shadow:inset 0 0 0 2px ${C.brassDark},inset 0 0 0 6px ${C.ink},inset 0 0 0 8px ${C.brass},0 12px 40px rgba(0,0,0,0.6);padding:12px;">
+      <div class="paper-bg" style="padding:32px 24px 40px;">
+
+        <!-- Header -->
+        <div style="text-align:center;margin-bottom:28px;">
+          <div class="label" style="color:${C.navy};margin-bottom:10px;">◆ Est. 2025 ◆</div>
+          <div style="display:inline-flex;align-items:stretch;margin-bottom:8px;">
+            <div style="background:${C.navy};color:${C.paper};padding:8px 18px;display:flex;align-items:center;">
+              <span class="display" style="font-size:52px;line-height:1;">The</span>
+            </div>
+            <div style="background:${C.ink};color:${C.paper};padding:8px 22px;display:flex;align-items:center;">
+              <span class="display" style="font-size:52px;line-height:1;">Cellar</span>
+            </div>
+          </div>
+          <div style="font-family:'Cormorant Garamond',serif;font-style:italic;font-size:17px;color:${C.navy};font-weight:500;">House Inventory</div>
+          <div style="display:flex;align-items:center;justify-content:center;gap:14px;margin-top:18px;">
+            <div style="height:2px;flex:1;max-width:120px;background:linear-gradient(90deg,transparent 0%,${C.brass} 20%,${C.brass} 80%,transparent 100%);"></div>
+            <span style="color:${C.navy};font-size:14px;">◆</span>
+            <div style="height:2px;flex:1;max-width:120px;background:linear-gradient(90deg,transparent 0%,${C.brass} 20%,${C.brass} 80%,transparent 100%);"></div>
+          </div>
+        </div>
+
+        <!-- Stats Banner -->
+        <div style="display:flex;justify-content:space-around;padding:16px 0;border-top:2px solid ${C.navy};border-bottom:2px solid ${C.navy};margin-bottom:28px;background:rgba(27,42,78,0.03);">
+          <div style="text-align:center;flex:1;">
+            <div class="display" style="font-size:36px;color:${C.navy};margin-bottom:4px;">${products.length}</div>
+            <div class="label" style="color:${C.inkSoft};">Sorten</div>
+          </div>
+          <div style="width:1px;background:${C.lineSoft};opacity:0.5;"></div>
+          <div style="text-align:center;flex:1;">
+            <div class="display" style="font-size:36px;color:${C.navy};margin-bottom:4px;">${totalAll()}</div>
+            <div class="label" style="color:${C.inkSoft};">Flaschen</div>
+          </div>
+          <div style="width:1px;background:${C.lineSoft};opacity:0.5;"></div>
+          <div style="text-align:center;flex:1;">
+            <div class="display" style="font-size:36px;color:${C.navy};margin-bottom:4px;">${locations.length}</div>
+            <div class="label" style="color:${C.inkSoft};">Orte</div>
+          </div>
+        </div>
+
+        <!-- Search -->
+        <input class="pub-input" id="search-input" type="text" placeholder="Suchen…" value="${search.replace(/"/g,'&quot;')}" style="margin-bottom:14px;">
+
+        <!-- Filter tabs -->
+        <div style="display:flex;margin-bottom:32px;border:2px solid ${C.ink};background:${C.paperDark};">
+          ${['all','cold','storage'].map((f,i) => {
+            const active = filter === f;
+            const labels = ['Alle','◆ Gekühlt','❖ Im Keller'];
+            return `<button data-action="set-filter" data-filter="${f}" style="flex:1;padding:14px 12px;background:${active ? C.navy : 'transparent'};color:${active ? C.paper : C.ink};border:none;${i<2?`border-right:2px solid ${C.ink};`:''}font-family:'Work Sans',sans-serif;font-size:12px;font-weight:700;letter-spacing:0.15em;text-transform:uppercase;cursor:pointer;">${labels[i]}</button>`;
+          }).join('')}
+        </div>
+
+        <!-- Locations -->
+        <div style="display:flex;align-items:center;gap:14px;margin-bottom:14px;">
+          <h2 class="display" style="font-size:28px;margin:0;color:${C.ink};line-height:1;">Die Orte</h2>
+          <div style="flex:1;height:1px;background:${C.ink};"></div>
+          <button data-action="open-add-location" style="background:none;border:none;color:${C.navy};cursor:pointer;font-family:'Work Sans',sans-serif;font-size:10px;font-weight:700;letter-spacing:0.22em;text-transform:uppercase;padding:0;">+ Hinzufügen</button>
+        </div>
+
+        <div style="display:grid;grid-template-columns:repeat(${colCount},1fr);margin-bottom:36px;border:2px solid ${C.ink};">
+          ${locations.length === 0
+            ? `<div style="padding:24px;text-align:center;color:${C.inkSoft};font-size:13px;background:${C.paperDark};">Noch keine Orte angelegt</div>`
+            : locations.map((loc, i) => `
+              <div class="loc-card" style="${i < locations.length-1 ? `border-right:2px solid ${C.ink};` : ''}">
+                <div class="label" style="color:${loc.isCold ? C.navy : C.brassDark};">${loc.isCold ? '◆ Gekühlt' : '❖ Lager'}</div>
+                <div style="font-family:'Work Sans',sans-serif;font-size:13px;font-weight:600;color:${C.ink};margin-top:8px;line-height:1.3;">${loc.name}</div>
+                <div class="display" style="font-size:40px;color:${C.navy};line-height:1;margin-top:8px;">${stockAtLoc(loc.id)}</div>
+                <button class="loc-del-btn" data-action="open-delete-location" data-lid="${loc.id}" aria-label="Ort löschen">×</button>
+              </div>`).join('')}
+        </div>
+
+        <!-- Products -->
+        <div style="display:flex;align-items:center;gap:14px;margin-bottom:14px;">
+          <h2 class="display" style="font-size:28px;margin:0;color:${C.ink};line-height:1;">Das Sortiment</h2>
+          <div style="flex:1;height:1px;background:${C.ink};"></div>
+        </div>
+
+        ${fp.length === 0
+          ? `<div style="padding:32px 20px;text-align:center;color:${C.inkSoft};font-size:14px;font-style:italic;font-family:'Cormorant Garamond',serif;border:1px dotted ${C.lineSoft};">Nichts gefunden.</div>`
+          : `<div>${fp.map(p => {
+            const vs = visibleStock(p.id);
+            const total = vs.reduce((s,x)=>s+x.quantity,0);
+            const imgStyle = p.imageUrl
+              ? `background:url('${p.imageUrl}') center/cover no-repeat;`
+              : `background:${C.navy};`;
+            return `
+            <div class="prod-row">
+              <div class="prod-initial" data-action="open-product-detail" data-pid="${p.id}" style="${imgStyle}${p.imageUrl?'':''}">
+                ${p.imageUrl ? '' : p.name.charAt(0)}
+              </div>
+              <div style="flex:1;min-width:0;">
+                <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:4px;cursor:pointer;" data-action="open-product-detail" data-pid="${p.id}">
+                  <h3 class="display" style="font-size:22px;margin:0;color:${C.ink};line-height:1.1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%;">${p.name}</h3>
+                  <div style="flex:1;border-bottom:1px dotted ${C.lineSoft};transform:translateY(-4px);min-width:8px;"></div>
+                  <span class="display" style="font-size:26px;color:${C.navy};line-height:1;flex-shrink:0;">${total}</span>
+                </div>
+                <div class="label" style="color:${C.inkSoft};margin-bottom:12px;">${p.type}</div>
+                <div style="display:flex;flex-direction:column;gap:8px;">
+                  ${vs.map(s=>`
+                    <div style="display:grid;grid-template-columns:14px 1fr auto;align-items:center;gap:8px;padding-left:4px;">
+                      <span style="color:${locIsCold(s.locationId)?C.navy:C.brassDark};font-size:11px;text-align:center;">${locIsCold(s.locationId)?'◆':'❖'}</span>
+                      <span style="font-family:'Work Sans',sans-serif;font-size:13px;color:${C.ink};font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${locName(s.locationId)}</span>
+                      ${renderStockControls(s.id)}
+                    </div>`).join('')}
+                </div>
+              </div>
+            </div>`;
+          }).join('')}</div>`}
+
+        <!-- Footer -->
+        <div style="margin-top:36px;padding-top:20px;border-top:2px solid ${C.navy};text-align:center;">
+          <div class="label" style="color:${C.navy};">◆ Cheers & Prost ◆</div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- FAB -->
+  <button class="fab" data-action="open-add-product" aria-label="Produkt hinzufügen">+</button>
+
+  <!-- MODAL -->
+  ${renderModal()}
+  `;
+}
+
+function renderModal() {
+  if (!activeModal) return '';
+
+  let inner = '';
+
+  if (activeModal === 'add-location') {
+    inner = `
+      ${modalHeader('Neuer Ort')}
+      <div style="display:flex;flex-direction:column;gap:14px;">
+        <input class="pub-input" id="loc-name" placeholder="Name (z.B. Kühlschrank Küche)" autofocus>
+        <div id="loc-cold" data-val="false" data-action="toggle-cold" style="display:flex;justify-content:space-between;align-items:center;padding:14px 16px;background:${C.paperDark};border:2px solid ${C.ink};cursor:pointer;">
+          <span style="font-size:14px;font-weight:600;color:${C.ink};">Ist ein Kühlschrank</span>
+          <div style="width:44px;height:24px;background:${C.lineSoft};position:relative;">
+            <div style="width:18px;height:18px;background:${C.paper};position:absolute;top:3px;left:3px;"></div>
+          </div>
+        </div>
+        <button data-action="confirm-add-location" style="width:100%;padding:14px;background:${C.navy};color:${C.paper};border:none;font-size:12px;font-weight:700;letter-spacing:0.18em;text-transform:uppercase;cursor:pointer;font-family:'Work Sans',sans-serif;">Hinzufügen</button>
+      </div>`;
+  }
+
+  if (activeModal === 'add-product') {
+    const firstLocId = locations[0]?.id || '';
+    inner = `
+      ${modalHeader('Neues Produkt')}
+      <div style="display:flex;flex-direction:column;gap:14px;">
+        <div style="position:relative;width:100%;height:160px;background:${C.paperDark};border:2px solid ${C.ink};cursor:pointer;display:flex;align-items:center;justify-content:center;overflow:hidden;" onclick="document.getElementById('photo-upload').click()">
+          <img id="preview-img" style="display:none;width:100%;height:100%;object-fit:cover;position:absolute;inset:0;">
+          <div id="preview-placeholder" style="text-align:center;">
+            <div class="display" style="font-size:24px;margin-bottom:4px;color:${C.ink};">Foto</div>
+            <div class="label" style="color:${C.inkSoft};">Antippen zum Hinzufügen</div>
+          </div>
+        </div>
+        <input type="file" id="photo-upload" accept="image/*" capture="environment" style="display:none;">
+
+        <!-- Barcode scan -->
+        <div>
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+            <button id="scan-btn" data-action="start-scan" style="display:inline-flex;align-items:center;gap:8px;padding:10px 16px;background:${C.navy};color:${C.paper};border:none;font-family:'Work Sans',sans-serif;font-size:11px;font-weight:700;letter-spacing:0.15em;text-transform:uppercase;cursor:pointer;">
+              ▷ Barcode scannen
+            </button>
+            <button data-action="stop-scan" style="display:none;padding:10px 14px;background:${C.danger};color:${C.paper};border:none;font-family:'Work Sans',sans-serif;font-size:11px;font-weight:700;cursor:pointer;letter-spacing:0.1em;">✕ Stop</button>
+            <span id="scan-status" style="font-size:11px;color:${C.inkSoft};font-family:'Work Sans',sans-serif;"></span>
+          </div>
+          <div id="scanner-wrap" style="display:none;margin-bottom:8px;">
+            <video id="scanner-video" autoplay muted playsinline></video>
+          </div>
+          <div id="barcode-display" style="font-size:10px;color:${C.inkSoft};font-family:'Work Sans',sans-serif;letter-spacing:0.05em;min-height:14px;"></div>
+        </div>
+
+        <input class="pub-input" id="add-name" placeholder="Name (z.B. Stauder Pils)" value="">
+        <select class="pub-input" id="add-type">
+          <option>Bier</option>
+          <option>Wein</option>
+          <option>Sonstige</option>
+        </select>
+
+        <div style="display:grid;grid-template-columns:2fr 1fr;border:2px solid ${C.ink};">
+          <select id="add-loc" style="padding:12px 14px;border:none;border-right:2px solid ${C.ink};background:${C.paper};font-size:14px;font-weight:500;color:${C.ink};outline:none;font-family:'Work Sans',sans-serif;">
+            ${locations.map(l=>`<option value="${l.id}">${l.name}</option>`).join('')}
+          </select>
+          <input type="text" inputmode="numeric" pattern="[0-9]*" id="add-qty" value="1" style="padding:12px;border:none;background:${C.paper};font-size:22px;font-family:'Bebas Neue',sans-serif;text-align:center;color:${C.navy};outline:none;">
+        </div>
+
+        <button data-action="confirm-add-product" style="width:100%;padding:14px;background:${C.navy};color:${C.paper};border:none;font-size:12px;font-weight:700;letter-spacing:0.18em;text-transform:uppercase;cursor:pointer;font-family:'Work Sans',sans-serif;">Hinzufügen</button>
+      </div>`;
+  }
+
+  if (activeModal === 'move') {
+    const s = stock.find(x => x.id === modalData.stockId);
+    if (!s) return '';
+    const p = products.find(x => x.id === s.productId);
+    const otherLocs = locations.filter(l => l.id !== s.locationId);
+    inner = `
+      ${modalHeader((p?.name||'') + ' verschieben')}
+      <div style="display:flex;flex-direction:column;gap:14px;">
+        <div style="padding:12px 14px;background:${C.paperDark};border:1.5px solid ${C.ink};font-size:13px;font-weight:500;color:${C.ink};">
+          <span class="label" style="color:${C.inkSoft};margin-right:8px;">Von</span>${locName(s.locationId)} · ${s.quantity} verfügbar
+        </div>
+        <select class="pub-input" id="move-to-loc">
+          ${otherLocs.map(l=>`<option value="${l.id}">${l.name}</option>`).join('')}
+        </select>
+        <div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+            <span class="label" style="color:${C.inkSoft};">Menge</span>
+            <input type="text" inputmode="numeric" id="move-amount" value="1" style="width:76px;padding:6px 10px;border:2px solid ${C.ink};background:${C.paper};font-size:22px;font-family:'Bebas Neue',sans-serif;text-align:center;outline:none;color:${C.navy};">
+          </div>
+          <input type="range" id="move-amount-range" min="1" max="${s.quantity}" value="1">
+        </div>
+        <button data-action="confirm-move" style="width:100%;padding:14px;background:${C.navy};color:${C.paper};border:none;font-size:12px;font-weight:700;letter-spacing:0.18em;text-transform:uppercase;cursor:pointer;font-family:'Work Sans',sans-serif;">Verschieben</button>
+      </div>`;
+  }
+
+  if (activeModal === 'product-detail') {
+    const p = products.find(x => x.id === modalData.productId);
+    if (!p) return '';
+    const ps = getStockForProduct(p.id);
+    const tot = ps.reduce((s,x)=>s+x.quantity,0);
+    inner = `
+      ${modalHeader(p.name)}
+      <div style="${p.imageUrl ? `width:100%;height:180px;background:url('${p.imageUrl}') center/cover;border:2px solid ${C.brass};margin-bottom:16px;` : `width:100%;height:180px;background:${C.navy};border:2px solid ${C.brass};margin-bottom:16px;display:flex;align-items:center;justify-content:center;font-family:'Bebas Neue',sans-serif;font-size:90px;color:${C.paper};line-height:1;`}">
+        ${p.imageUrl ? '' : p.name.charAt(0)}
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:20px;">
+        <span class="label" style="color:${C.inkSoft};">${p.type}</span>
+        <div class="display" style="font-size:36px;color:${C.navy};line-height:1;">${tot}</div>
+      </div>
+      <div style="height:2px;background:${C.navy};margin-bottom:14px;"></div>
+      <div class="label" style="color:${C.ink};margin-bottom:12px;">Bestände</div>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:24px;">
+        ${ps.map(s=>`
+          <div style="display:grid;grid-template-columns:14px 1fr auto;align-items:center;gap:10px;padding:10px 12px;background:${C.paperDark};border:1.5px solid ${C.ink};">
+            <span style="color:${locIsCold(s.locationId)?C.navy:C.brassDark};font-size:11px;text-align:center;">${locIsCold(s.locationId)?'◆':'❖'}</span>
+            <span style="font-family:'Work Sans',sans-serif;font-size:13px;font-weight:500;color:${C.ink};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${locName(s.locationId)}</span>
+            ${renderStockControls(s.id)}
+          </div>`).join('')}
+      </div>
+      <button data-action="delete-product" style="width:100%;padding:12px;background:transparent;border:2px solid ${C.danger};color:${C.danger};font-size:12px;font-weight:700;letter-spacing:0.18em;text-transform:uppercase;cursor:pointer;font-family:'Work Sans',sans-serif;">Produkt löschen</button>`;
+  }
+
+  if (activeModal === 'confirm-delete-location') {
+    const loc = locations.find(l => l.id === modalData.locId);
+    if (!loc) return '';
+    const affected = stockAffectedByLocDelete(loc.id);
+    inner = `
+      ${modalHeader('Ort löschen?')}
+      <div style="display:flex;gap:12px;padding:14px 16px;background:rgba(139,32,32,0.08);border:1.5px solid ${C.danger};margin-bottom:20px;align-items:flex-start;">
+        <span style="color:${C.danger};font-size:20px;flex-shrink:0;">⚠</span>
+        <div style="font-size:13px;color:${C.ink};line-height:1.5;">
+          <strong>${loc.name}</strong> wird gelöscht.
+          ${affected > 0 ? `<strong> ${affected} Flaschen</strong> an diesem Ort werden ebenfalls entfernt.` : ''}
+        </div>
+      </div>
+      <div class="label" style="color:${C.inkSoft};margin-bottom:8px;">Zur Bestätigung „LÖSCHEN" eingeben</div>
+      <input class="pub-input" id="confirm-delete-input" placeholder="LÖSCHEN" autofocus style="margin-bottom:16px;font-weight:700;letter-spacing:0.1em;">
+      <div style="display:grid;grid-template-columns:1fr 1fr;border:2px solid ${C.ink};">
+        <button data-action="close-modal" style="padding:14px;background:${C.paperDark};border:none;border-right:2px solid ${C.ink};font-family:'Work Sans',sans-serif;font-size:12px;font-weight:700;letter-spacing:0.18em;text-transform:uppercase;cursor:pointer;color:${C.ink};">Abbrechen</button>
+        <button id="confirm-delete-btn" data-action="confirm-delete-location" disabled style="padding:14px;background:${C.disabled};color:${C.paper};border:none;font-family:'Work Sans',sans-serif;font-size:12px;font-weight:700;letter-spacing:0.18em;text-transform:uppercase;cursor:not-allowed;">Löschen</button>
+      </div>`;
+  }
+
+  if (!inner) return '';
+
+  return `
+  <div class="modal-overlay" id="modal-overlay" data-action="modal-overlay-close">
+    <div class="modal-box">
+      <div class="paper-bg modal-inner">${inner}</div>
+    </div>
+  </div>`;
+}
+
+function modalHeader(title) {
+  return `
+  <div style="margin-bottom:20px;">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;">
+      <h2 class="display" style="font-size:26px;margin:0;line-height:1.1;color:${C.ink};max-width:85%;word-break:break-word;">${title}</h2>
+      <button data-action="close-modal" style="width:30px;height:30px;background:${C.paperDark};border:1.5px solid ${C.ink};cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:700;color:${C.ink};padding:0;line-height:1;flex-shrink:0;font-family:'Work Sans',sans-serif;">×</button>
+    </div>
+    <div style="height:2px;background:${C.navy};"></div>
+  </div>`;
+}
+
+// After scanner starts, need to also toggle the stop button correctly
+document.addEventListener('click', (e) => {
+  const t = e.target.closest('[data-action]');
+  if (!t) return;
+  if (t.dataset.action === 'start-scan') {
+    setTimeout(() => {
+      const stopBtn = document.querySelector('[data-action="stop-scan"]');
+      if (stopBtn) stopBtn.style.display = 'inline-flex';
+    }, 100);
+  }
+  if (t.dataset.action === 'stop-scan') {
+    const wrap = document.getElementById('scanner-wrap');
+    const scanBtn = document.getElementById('scan-btn');
+    const stopBtn = document.querySelector('[data-action="stop-scan"]');
+    if (wrap) wrap.style.display = 'none';
+    if (scanBtn) scanBtn.style.display = 'inline-flex';
+    if (stopBtn) stopBtn.style.display = 'none';
+    if (document.getElementById('scan-status')) document.getElementById('scan-status').textContent = '';
+  }
+  // confirm-delete-location: update button style when valid
+  if (t.dataset.action === 'confirm-delete-location') {
+    const btn = document.getElementById('confirm-delete-btn');
+    if (btn && !btn.disabled) {
+      btn.style.background = C.danger;
+      btn.style.cursor = 'pointer';
+    }
+  }
+});
+
+// Confirm delete button live style update
+document.addEventListener('input', (e) => {
+  if (e.target.id === 'confirm-delete-input') {
+    const btn = document.getElementById('confirm-delete-btn');
+    if (!btn) return;
+    const valid = e.target.value.trim().toUpperCase() === 'LÖSCHEN';
+    btn.disabled = !valid;
+    btn.style.background = valid ? C.danger : C.disabled;
+    btn.style.cursor = valid ? 'pointer' : 'not-allowed';
+  }
+});
+
+// Initial render with loading state
+document.getElementById('app').innerHTML = `
+  <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#1A1410;">
+    <div style="text-align:center;color:#A8842F;font-family:'Bebas Neue',sans-serif;font-size:48px;letter-spacing:0.1em;">
+      The Cellar<br>
+      <span style="font-size:14px;font-family:'Work Sans',sans-serif;font-weight:500;letter-spacing:0.2em;color:#F2E8D5;opacity:0.5;">Verbinde mit Firebase…</span>
+    </div>
+  </div>`;
+</script>
+
+<!-- ZXing barcode library -->
+<script src="https://unpkg.com/@zxing/library@0.20.0/umd/index.min.js"></script>
+
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #1A1410; min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+</body>
+</html>
