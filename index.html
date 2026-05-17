@@ -1,0 +1,1140 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>The Cellar — House Inventory</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Work+Sans:wght@400;500;600;700;800&family=Bebas+Neue&family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&display=swap" rel="stylesheet">
+
+<!-- FIX #1: ZXing muss VOR dem ES-Modul geladen sein, sonst ist ZXing beim ersten scan() undefined -->
+<script src="https://unpkg.com/@zxing/library@0.20.0/umd/index.min.js"></script>
+
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #1A1410; min-height: 100vh; }
+  @keyframes fadeIn  { from { opacity: 0; }           to { opacity: 1; } }
+  @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+
+  /* Static styles — declared once, not re-injected on every render (FIX #12) */
+  .display { font-family: 'Bebas Neue', sans-serif; letter-spacing: 0.02em; line-height: 0.95; }
+  .label   { font-family: 'Work Sans', sans-serif; font-size: 10px; font-weight: 700; letter-spacing: 0.22em; text-transform: uppercase; }
+  .paper-bg {
+    background-color: #F2E8D5;
+    background-image:
+      radial-gradient(ellipse at top left,    rgba(168,132,47,0.06) 0%, transparent 50%),
+      radial-gradient(ellipse at bottom right, rgba(27,42,78,0.05)  0%, transparent 50%),
+      repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(58,42,30,0.012) 2px, rgba(58,42,30,0.012) 4px);
+  }
+  .pub-input {
+    width: 100%; padding: 12px 14px; border: 2px solid #1C1814;
+    background: #F2E8D5; font-size: 14px; font-weight: 500; color: #1C1814;
+    font-family: 'Work Sans', sans-serif; border-radius: 0; outline: none;
+  }
+  .pub-input:focus    { background: #fff; }
+  .pub-input::placeholder { color: #8B7559; }
+  .fab {
+    position: fixed; bottom: 32px; right: 24px; width: 64px; height: 64px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 30% 30%, #A8842F 0%, #6F5621 100%);
+    color: #1C1814; border: none; font-size: 36px; font-family: 'Bebas Neue', sans-serif;
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+    z-index: 50; box-shadow: 0 6px 16px rgba(0,0,0,0.5), inset 0 0 0 2px #6F5621;
+  }
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(10,6,4,0.75);
+    backdrop-filter: blur(6px); z-index: 100;
+    display: flex; align-items: flex-end; justify-content: center;
+    animation: fadeIn 0.2s ease;
+  }
+  .modal-box {
+    background: linear-gradient(135deg, #3D2718 0%, #1A1410 100%);
+    padding: 10px; width: 100%; max-width: 480px;
+    box-shadow: 0 -8px 30px rgba(0,0,0,0.5);
+    animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    max-height: 90vh; overflow-y: auto;
+  }
+  .modal-inner { padding: 24px 22px 28px; }
+  @media (min-width: 720px) {
+    .modal-overlay { align-items: center; padding: 24px; }
+    .modal-box { max-width: 520px; }
+  }
+  input[type=range] { accent-color: #1B2A4E; width: 100%; }
+  video { width: 100%; border: 2px solid #A8842F; display: block; }
+  select option { background: #F2E8D5; color: #1C1814; }
+  .loc-card {
+    background: #E5D8BB; padding: 18px; text-align: center; min-height: 130px;
+    display: flex; flex-direction: column; justify-content: space-between; position: relative;
+  }
+  .loc-del-btn {
+    position: absolute; top: 8px; right: 8px; width: 22px; height: 22px;
+    background: #8B2020; color: #F2E8D5; border: none; cursor: pointer;
+    font-size: 14px; font-weight: 700; display: flex; align-items: center;
+    justify-content: center; padding: 0; line-height: 1;
+  }
+  .prod-row { padding: 20px 0; display: flex; gap: 18px; align-items: flex-start; }
+  .prod-row + .prod-row { border-top: 1px dotted #8B7559; }
+  .prod-initial {
+    width: 60px; height: 72px; background: #1B2A4E; color: #F2E8D5;
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Bebas Neue', sans-serif; font-size: 44px; flex-shrink: 0;
+    border: 2px solid #A8842F; cursor: pointer; overflow: hidden;
+  }
+  @media (max-width: 400px) { .fab { bottom: 20px; right: 16px; } }
+
+  /* Toast notification */
+  #toast {
+    position: fixed; bottom: 110px; left: 50%; transform: translateX(-50%);
+    background: #8B2020; color: #F2E8D5; padding: 10px 20px;
+    font-family: 'Work Sans', sans-serif; font-size: 13px; font-weight: 600;
+    z-index: 200; display: none; white-space: nowrap;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <!-- Loading screen — replaced by first render() after all 3 snapshots fire -->
+  <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#1A1410;">
+    <div style="text-align:center;color:#A8842F;font-family:'Bebas Neue',sans-serif;font-size:48px;letter-spacing:0.1em;">
+      The Cellar<br>
+      <span style="font-size:14px;font-family:'Work Sans',sans-serif;font-weight:500;letter-spacing:0.2em;color:#F2E8D5;opacity:0.5;">Verbinde mit Firebase…</span>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script type="module">
+import { initializeApp }   from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
+import {
+  getAuth, signInWithEmailAndPassword, onAuthStateChanged
+} from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
+import {
+  getFirestore, collection, doc,
+  onSnapshot, addDoc, updateDoc, deleteDoc,
+  runTransaction
+} from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+
+// ─── Firebase ─────────────────────────────────────────────────────
+const app = initializeApp({
+  apiKey:            "AIzaSyC9TQc6D4gTKIrnS18WLylZMJGyvUWx5C0",
+  authDomain:        "the-cellar-898ca.firebaseapp.com",
+  projectId:         "the-cellar-898ca",
+  storageBucket:     "the-cellar-898ca.firebasestorage.app",
+  messagingSenderId: "563417876719",
+  appId:             "1:563417876719:web:c6e5dd74b017311e8fb31a"
+});
+const auth = getAuth(app);
+const db   = getFirestore(app);
+
+// ─── Design tokens (used in JS-generated HTML) ────────────────────
+const C = {
+  bg:          '#1A1410', paper:      '#F2E8D5', paperDark:  '#E5D8BB',
+  paperDarker: '#D8C9A8', ink:        '#1C1814', inkSoft:    '#5C4E3F',
+  brass:       '#A8842F', brassDark:  '#6F5621', navy:       '#1B2A4E',
+  danger:      '#8B2020', lineSoft:   '#8B7559', disabled:   '#B8AB8E',
+};
+
+// ─── PIN Screen ───────────────────────────────────────────────────
+const PIN_EMAIL    = 'admin@cellar.local';
+const PIN_PASSWORD = '15031986';
+
+function showPinScreen(errorMsg = '') {
+  const appEl = document.getElementById('app');
+  appEl.innerHTML = `
+  <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;
+              background:#1A1410;padding:24px;">
+    <div style="width:100%;max-width:340px;">
+
+      <!-- Logo -->
+      <div style="text-align:center;margin-bottom:40px;">
+        <div style="display:inline-flex;align-items:stretch;margin-bottom:8px;">
+          <div style="background:#1B2A4E;color:#F2E8D5;padding:6px 16px;display:flex;align-items:center;">
+            <span style="font-family:'Bebas Neue',sans-serif;font-size:42px;line-height:1;">The</span>
+          </div>
+          <div style="background:#1C1814;color:#F2E8D5;padding:6px 18px;display:flex;align-items:center;">
+            <span style="font-family:'Bebas Neue',sans-serif;font-size:42px;line-height:1;">Cellar</span>
+          </div>
+        </div>
+        <div style="font-family:'Cormorant Garamond',serif;font-style:italic;font-size:15px;
+                    color:#A8842F;margin-top:4px;">House Inventory</div>
+      </div>
+
+      <!-- PIN display -->
+      <div id="pin-display"
+           style="font-family:'Bebas Neue',sans-serif;font-size:48px;letter-spacing:0.25em;
+                  text-align:center;color:#F2E8D5;min-height:64px;margin-bottom:8px;
+                  background:#1C1814;border:2px solid #A8842F;padding:10px 20px;">
+        &nbsp;
+      </div>
+
+      <!-- Error -->
+      <div id="pin-error"
+           style="text-align:center;font-family:'Work Sans',sans-serif;font-size:12px;
+                  font-weight:700;letter-spacing:0.1em;color:#8B2020;min-height:20px;
+                  margin-bottom:16px;">
+        ${errorMsg}
+      </div>
+
+      <!-- Numpad -->
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;">
+        ${[1,2,3,4,5,6,7,8,9,'','0','⌫'].map(k => `
+          <button data-pin-key="${k}"
+            style="padding:20px 0;background:${k === '' ? 'transparent' : '#2A1F18'};
+                   border:${k === '' ? 'none' : '1.5px solid #3D2E24'};
+                   color:#F2E8D5;font-family:'Work Sans',sans-serif;font-size:22px;
+                   font-weight:600;cursor:${k === '' ? 'default' : 'pointer'};
+                   border-radius:0;-webkit-tap-highlight-color:transparent;
+                   transition:background 0.1s;"
+            ${k === '' ? 'disabled' : ''}
+            onpointerdown="this.style.background='${k === '' ? 'transparent' : '#A8842F'}'"
+            onpointerup="this.style.background='${k === '' ? 'transparent' : '#2A1F18'}'"
+            onpointerleave="this.style.background='${k === '' ? 'transparent' : '#2A1F18'}'">
+            ${k}
+          </button>`).join('')}
+      </div>
+
+    </div>
+  </div>`;
+
+  // PIN-Logik
+  let pin = '';
+
+  function updateDisplay() {
+    const el = document.getElementById('pin-display');
+    if (el) el.textContent = pin ? '●'.repeat(pin.length) : '\u00a0';
+  }
+
+  async function submitPin() {
+    if (pin.length < 4) return;
+    const errEl = document.getElementById('pin-error');
+    if (errEl) errEl.textContent = '';
+    try {
+      await signInWithEmailAndPassword(auth, PIN_EMAIL, pin);
+      // onAuthStateChanged übernimmt ab hier
+    } catch(e) {
+      pin = '';
+      updateDisplay();
+      if (errEl) errEl.textContent = 'Falscher Code';
+    }
+  }
+
+  document.querySelectorAll('[data-pin-key]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const k = btn.dataset.pinKey;
+      if (k === '') return;
+      if (k === '⌫') {
+        pin = pin.slice(0, -1);
+        updateDisplay();
+        return;
+      }
+      if (pin.length >= 12) return;
+      pin += k;
+      updateDisplay();
+      // Auto-submit sobald der Code lang genug ist (8 Stellen)
+      if (pin.length === PIN_PASSWORD.length) {
+        await submitPin();
+      }
+    });
+  });
+}
+
+// ─── App state ────────────────────────────────────────────────────
+let locations = [];
+let products  = [];
+let stock     = [];
+
+let filter      = 'all';
+let search      = '';
+let activeModal = null;
+let modalData   = {};
+
+// Scanner state
+let scannerInstance = null;
+let barcodeValue    = '';
+
+// FIX #2: Render batching — only render after all 3 snapshots have fired at least once
+let snapshotReady = { locations: false, products: false, stock: false };
+let renderScheduled = false;
+function scheduleRender() {
+  if (!snapshotReady.locations || !snapshotReady.products || !snapshotReady.stock) return;
+  if (renderScheduled) return;
+  renderScheduled = true;
+  requestAnimationFrame(() => { renderScheduled = false; render(); });
+}
+
+// FIX #16: Fokus-Erhaltung über Re-Renders hinweg.
+// Problem: Jeder Tastendruck im Suchfeld triggert render() → innerHTML wird
+// komplett neu geschrieben → Input-Element wird zerstört → Fokus weg →
+// mobile Tastatur klappt zu. Lösung: Vor render() merken wir uns, welches
+// Eingabefeld den Fokus hatte (+ Cursor-Position), nach render() stellen
+// wir das wieder her.
+function captureFocus() {
+  const el = document.activeElement;
+  if (!el || !el.id) return null;
+  // Nur für relevante Eingabefelder (vermeidet versehentliches Fokussieren von Buttons o.ä.)
+  if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') return null;
+  return {
+    id: el.id,
+    start: el.selectionStart,
+    end: el.selectionEnd,
+  };
+}
+function restoreFocus(snapshot) {
+  if (!snapshot) return;
+  const el = document.getElementById(snapshot.id);
+  if (!el) return;
+  el.focus();
+  // selectionStart/End nur bei text-like Inputs setzen, sonst wirft es bei z.B. type=range
+  try {
+    if (snapshot.start != null && el.setSelectionRange) {
+      el.setSelectionRange(snapshot.start, snapshot.end);
+    }
+  } catch(_) { /* manche Input-Typen unterstützen das nicht */ }
+}
+
+// ─── Firestore listeners (nur nach Login) ─────────────────────────
+function startApp() {
+  onSnapshot(collection(db, 'locations'), snap => {
+    locations = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    snapshotReady.locations = true;
+    scheduleRender();
+  });
+  onSnapshot(collection(db, 'products'), snap => {
+    products = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    snapshotReady.products = true;
+    scheduleRender();
+  });
+  onSnapshot(collection(db, 'stock'), snap => {
+    stock = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    snapshotReady.stock = true;
+    scheduleRender();
+  });
+}
+
+// ─── Auth gate ────────────────────────────────────────────────────
+onAuthStateChanged(auth, user => {
+  if (user) {
+    startApp();
+  } else {
+    showPinScreen();
+  }
+});
+
+// ─── Error toast ──────────────────────────────────────────────────
+// FIX #13: Visible error feedback for failed writes
+function showError(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => { t.style.display = 'none'; }, 4000);
+}
+
+// ─── HTML escaping — FIX #15 ─────────────────────────────────────
+function esc(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// ─── Firestore actions ────────────────────────────────────────────
+async function addLocation(name, isCold) {
+  try {
+    await addDoc(collection(db, 'locations'), { name, isCold });
+  } catch(e) { showError('Ort konnte nicht gespeichert werden.'); }
+}
+
+async function deleteLocation(locId) {
+  try {
+    await deleteDoc(doc(db, 'locations', locId));
+    const affected = stock.filter(s => s.locationId === locId);
+    await Promise.all(affected.map(s => deleteDoc(doc(db, 'stock', s.id))));
+  } catch(e) { showError('Löschen fehlgeschlagen.'); }
+}
+
+async function addProduct(name, type, imageUrl, barcode) {
+  try {
+    const ref = await addDoc(collection(db, 'products'), {
+      name, type,
+      imageUrl: imageUrl || null,
+      barcode:  barcode  || null
+    });
+    return ref.id;
+  } catch(e) { showError('Produkt konnte nicht gespeichert werden.'); return null; }
+}
+
+async function deleteProduct(productId) {
+  try {
+    await deleteDoc(doc(db, 'products', productId));
+    const affected = stock.filter(s => s.productId === productId);
+    await Promise.all(affected.map(s => deleteDoc(doc(db, 'stock', s.id))));
+  } catch(e) { showError('Löschen fehlgeschlagen.'); }
+}
+
+// FIX #14: addStock uses a Firestore transaction to prevent race conditions
+async function addStock(productId, locationId, quantity) {
+  try {
+    const existing = stock.find(s => s.productId === productId && s.locationId === locationId);
+    if (existing) {
+      const ref = doc(db, 'stock', existing.id);
+      await runTransaction(db, async tx => {
+        const snap = await tx.get(ref);
+        if (!snap.exists()) {
+          tx.set(ref, { productId, locationId, quantity });
+        } else {
+          tx.update(ref, { quantity: snap.data().quantity + quantity });
+        }
+      });
+    } else {
+      await addDoc(collection(db, 'stock'), { productId, locationId, quantity });
+    }
+  } catch(e) { showError('Bestand konnte nicht aktualisiert werden.'); }
+}
+
+async function changeStock(stockId, delta) {
+  try {
+    const ref = doc(db, 'stock', stockId);
+    await runTransaction(db, async tx => {
+      const snap = await tx.get(ref);
+      if (!snap.exists()) return;
+      const newQty = snap.data().quantity + delta;
+      if (newQty <= 0) tx.delete(ref);
+      else             tx.update(ref, { quantity: newQty });
+    });
+  } catch(e) { showError('Bestand konnte nicht aktualisiert werden.'); }
+}
+
+async function moveStock(stockId, toLocationId, amount) {
+  try {
+    const s = stock.find(x => x.id === stockId);
+    if (!s) return;
+    // Step 1: decrement source (transaction)
+    const srcRef = doc(db, 'stock', stockId);
+    await runTransaction(db, async tx => {
+      const snap = await tx.get(srcRef);
+      if (!snap.exists()) return;
+      const newQty = snap.data().quantity - amount;
+      if (newQty <= 0) tx.delete(srcRef);
+      else             tx.update(srcRef, { quantity: newQty });
+    });
+    // Step 2: add to destination
+    await addStock(s.productId, toLocationId, amount);
+  } catch(e) { showError('Verschieben fehlgeschlagen.'); }
+}
+
+// ─── Computed helpers ─────────────────────────────────────────────
+function getStockForProduct(pid) { return stock.filter(s => s.productId === pid); }
+function totalAll() { return stock.reduce((sum, s) => sum + s.quantity, 0); }
+function coldLocIds() { return locations.filter(l => l.isCold).map(l => l.id); }
+function warmLocIds() { return locations.filter(l => !l.isCold).map(l => l.id); }
+
+function filteredProducts() {
+  const q = search.toLowerCase();
+  return products.filter(p => {
+    if (q && !p.name.toLowerCase().includes(q)) return false;
+    const ps = getStockForProduct(p.id);
+    if (filter === 'cold')    return ps.some(s => coldLocIds().includes(s.locationId));
+    if (filter === 'storage') return ps.some(s => warmLocIds().includes(s.locationId));
+    return ps.length > 0;
+  });
+}
+
+function visibleStock(productId) {
+  const ps = getStockForProduct(productId);
+  if (filter === 'cold')    return ps.filter(s => coldLocIds().includes(s.locationId));
+  if (filter === 'storage') return ps.filter(s => warmLocIds().includes(s.locationId));
+  return ps;
+}
+
+function locName(id)   { return locations.find(l => l.id === id)?.name || '?'; }
+function locIsCold(id) { return locations.find(l => l.id === id)?.isCold || false; }
+function stockAtLoc(locId) {
+  return stock.filter(s => s.locationId === locId).reduce((sum, s) => sum + s.quantity, 0);
+}
+
+// ─── UPCitemdb lookup ─────────────────────────────────────────────
+async function lookupBarcode(code) {
+  try {
+    const res  = await fetch(`https://api.upcitemdb.com/prod/trial/lookup?upc=${code}`);
+    const data = await res.json();
+    if (data.items?.length > 0) {
+      const item = data.items[0];
+      return { name: item.title || '', image: item.images?.[0] || '' };
+    }
+  } catch(e) {}
+  return null;
+}
+
+// ─── Scanner ──────────────────────────────────────────────────────
+function startScanner() {
+  const scanEl = document.getElementById('scanner-video');
+  if (!scanEl) return;
+
+  // FIX #1: ZXing is now guaranteed loaded (classic script before module)
+  const codeReader = new ZXing.BrowserMultiFormatReader();
+  scannerInstance  = codeReader;
+
+  setScanUI('active');
+
+  codeReader.decodeFromVideoDevice(null, 'scanner-video', async (result, err) => {
+    if (!result) return;
+    const code = result.getText();
+    stopScanner();
+    setScanStatus('Suche Produkt…', C.inkSoft);
+    barcodeValue = code;
+
+    const found = await lookupBarcode(code);
+    const nameEl = document.getElementById('add-name');
+    const imgEl  = document.getElementById('preview-img');
+    const phEl   = document.getElementById('preview-placeholder');
+    const bdEl   = document.getElementById('barcode-display');
+
+    if (bdEl) bdEl.textContent = code;
+
+    if (found && found.name) {
+      if (nameEl) nameEl.value = found.name;
+      if (found.image && imgEl && phEl) {
+        imgEl.src = found.image; imgEl.style.display = 'block'; phEl.style.display = 'none';
+      }
+      setScanStatus('✓ Produkt gefunden', C.navy);
+    } else {
+      setScanStatus('Nicht gefunden — bitte manuell eingeben', C.danger);
+    }
+    setScanUI('idle');
+  });
+}
+
+function stopScanner() {
+  if (scannerInstance) { scannerInstance.reset(); scannerInstance = null; }
+  setScanUI('idle');
+}
+
+function setScanUI(state) {
+  const scanBtn = document.getElementById('scan-btn');
+  const stopBtn = document.getElementById('stop-btn');
+  const wrap    = document.getElementById('scanner-wrap');
+  if (!scanBtn || !stopBtn || !wrap) return;
+  if (state === 'active') {
+    scanBtn.style.display = 'none';
+    stopBtn.style.display = 'inline-flex';
+    wrap.style.display    = 'block';
+    setScanStatus('Kamera aktiv – Barcode einrahmen', C.inkSoft);
+  } else {
+    scanBtn.style.display = 'inline-flex';
+    stopBtn.style.display = 'none';
+    wrap.style.display    = 'none';
+  }
+}
+
+function setScanStatus(msg, color) {
+  const el = document.getElementById('scan-status');
+  if (el) { el.textContent = msg; el.style.color = color || C.inkSoft; }
+}
+
+// ─── Modal helpers ────────────────────────────────────────────────
+function openModal(name, data = {}) {
+  stopScanner();
+  activeModal = name;
+  modalData   = data;
+  render();
+}
+
+function closeModal() {
+  stopScanner();
+  activeModal  = null;
+  modalData    = {};
+  barcodeValue = '';
+  render();
+}
+
+// ─── Toggle helper (FIX #3: no more nested id="loc-cold") ─────────
+// The toggle state is tracked in a module-level variable, not DOM data-val
+let locColdState = false;
+
+function renderToggleHTML(val) {
+  return `
+  <div id="loc-cold-toggle" data-action="toggle-cold"
+       style="display:flex;justify-content:space-between;align-items:center;
+              padding:14px 16px;background:${C.paperDark};border:2px solid ${C.ink};cursor:pointer;">
+    <span style="font-size:14px;font-weight:600;color:${C.ink};">Ist ein Kühlschrank</span>
+    <div style="width:44px;height:24px;background:${val ? C.navy : C.lineSoft};position:relative;transition:background 0.2s;">
+      <div style="width:18px;height:18px;background:${C.paper};position:absolute;top:3px;
+                  left:${val ? '23px' : '3px'};transition:left 0.2s;"></div>
+    </div>
+  </div>`;
+}
+
+// ─── Shared button builders ───────────────────────────────────────
+function pubBtn(action, dataset, label, ariaLabel) {
+  return `<button data-action="${action}" ${dataset} aria-label="${ariaLabel}"
+    style="width:28px;height:28px;background:${C.paperDarker};border:1px solid ${C.brassDark};
+           cursor:pointer;font-size:13px;font-family:'Work Sans',sans-serif;font-weight:700;
+           color:${C.ink};display:inline-flex;align-items:center;justify-content:center;
+           padding:0;line-height:1;flex-shrink:0;">${label}</button>`;
+}
+
+function renderStockControls(stockId) {
+  return `<div style="display:flex;align-items:center;gap:4px;flex-shrink:0;">
+    ${pubBtn('open-move',  `data-sid="${stockId}"`, '→', 'Verschieben')}
+    ${pubBtn('decrement',  `data-sid="${stockId}"`, '−', 'Entnehmen')}
+    ${pubBtn('increment',  `data-sid="${stockId}"`, '+', 'Hinzufügen')}
+  </div>`;
+}
+
+function primaryBtn(action, label, disabled = false) {
+  return `<button data-action="${action}" ${disabled ? 'disabled' : ''}
+    style="width:100%;padding:14px;background:${disabled ? C.disabled : C.navy};
+           color:${C.paper};border:none;font-size:12px;font-weight:700;
+           letter-spacing:0.18em;text-transform:uppercase;
+           cursor:${disabled ? 'not-allowed' : 'pointer'};
+           font-family:'Work Sans',sans-serif;">${label}</button>`;
+}
+
+function modalHeader(title) {
+  return `
+  <div style="margin-bottom:20px;">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;">
+      <h2 class="display" style="font-size:26px;margin:0;line-height:1.1;color:${C.ink};max-width:85%;word-break:break-word;">${title}</h2>
+      <button data-action="close-modal"
+        style="width:30px;height:30px;background:${C.paperDark};border:1.5px solid ${C.ink};
+               cursor:pointer;display:flex;align-items:center;justify-content:center;
+               font-size:16px;font-weight:700;color:${C.ink};padding:0;line-height:1;
+               flex-shrink:0;font-family:'Work Sans',sans-serif;">×</button>
+    </div>
+    <div style="height:2px;background:${C.navy};"></div>
+  </div>`;
+}
+
+// ─── Modal renderer ───────────────────────────────────────────────
+function renderModal() {
+  if (!activeModal) return '';
+  let inner = '';
+
+  // ── Add location ──────────────────────────────────────────────
+  if (activeModal === 'add-location') {
+    locColdState = false; // reset toggle state on open
+    inner = `
+      ${modalHeader('Neuer Ort')}
+      <div style="display:flex;flex-direction:column;gap:14px;">
+        <input class="pub-input" id="loc-name" placeholder="Name (z.B. Kühlschrank Küche)" autofocus>
+        ${renderToggleHTML(false)}
+        ${primaryBtn('confirm-add-location', 'Hinzufügen')}
+      </div>`;
+  }
+
+  // ── Add product ───────────────────────────────────────────────
+  if (activeModal === 'add-product') {
+    // FIX #4: disable move if no locations at all (handled elsewhere, here just locations list)
+    inner = `
+      ${modalHeader('Neues Produkt')}
+      <div style="display:flex;flex-direction:column;gap:14px;">
+
+        <!-- Photo upload -->
+        <div onclick="document.getElementById('photo-upload').click()"
+             style="position:relative;width:100%;height:160px;background:${C.paperDark};
+                    border:2px solid ${C.ink};cursor:pointer;display:flex;
+                    align-items:center;justify-content:center;overflow:hidden;">
+          <img id="preview-img" style="display:none;width:100%;height:100%;object-fit:cover;position:absolute;inset:0;">
+          <div id="preview-placeholder" style="text-align:center;pointer-events:none;">
+            <div class="display" style="font-size:24px;margin-bottom:4px;color:${C.ink};">Foto</div>
+            <div class="label" style="color:${C.inkSoft};">Antippen zum Hinzufügen</div>
+          </div>
+        </div>
+        <!-- FIX #5: no capture="environment" on file input — let user choose gallery or camera.
+             Base64 from local file is NOT stored in Firestore. imageUrl is only set when
+             a URL comes from UPCitemdb. Local previews stay local (session only). -->
+        <input type="file" id="photo-upload" accept="image/*" style="display:none;">
+
+        <!-- Barcode scan -->
+        <div>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
+            <button id="scan-btn" data-action="start-scan"
+              style="display:inline-flex;align-items:center;gap:8px;padding:10px 16px;
+                     background:${C.navy};color:${C.paper};border:none;
+                     font-family:'Work Sans',sans-serif;font-size:11px;font-weight:700;
+                     letter-spacing:0.15em;text-transform:uppercase;cursor:pointer;">
+              ▷ Barcode scannen
+            </button>
+            <button id="stop-btn" data-action="stop-scan"
+              style="display:none;padding:10px 14px;background:${C.danger};color:${C.paper};
+                     border:none;font-family:'Work Sans',sans-serif;font-size:11px;
+                     font-weight:700;cursor:pointer;letter-spacing:0.1em;">
+              ✕ Stop
+            </button>
+            <span id="scan-status" style="font-size:11px;color:${C.inkSoft};font-family:'Work Sans',sans-serif;flex:1;min-width:100px;"></span>
+          </div>
+          <div id="scanner-wrap" style="display:none;margin-bottom:8px;">
+            <video id="scanner-video" autoplay muted playsinline></video>
+          </div>
+          <div id="barcode-display" style="font-size:10px;color:${C.inkSoft};font-family:'Work Sans',sans-serif;letter-spacing:0.05em;min-height:14px;"></div>
+        </div>
+
+        <input class="pub-input" id="add-name" placeholder="Name (z.B. Stauder Pils)" value="">
+        <select class="pub-input" id="add-type">
+          <option>Bier</option>
+          <option>Wein</option>
+          <option>Sonstige</option>
+        </select>
+
+        <div style="display:grid;grid-template-columns:2fr 1fr;border:2px solid ${C.ink};">
+          <select id="add-loc"
+            style="padding:12px 14px;border:none;border-right:2px solid ${C.ink};
+                   background:${C.paper};font-size:14px;font-weight:500;color:${C.ink};
+                   outline:none;font-family:'Work Sans',sans-serif;">
+            ${locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join('')}
+          </select>
+          <input type="text" inputmode="numeric" pattern="[0-9]*" id="add-qty" value="1"
+            style="padding:12px;border:none;background:${C.paper};font-size:22px;
+                   font-family:'Bebas Neue',sans-serif;text-align:center;color:${C.navy};outline:none;">
+        </div>
+
+        ${primaryBtn('confirm-add-product', 'Hinzufügen')}
+      </div>`;
+  }
+
+  // ── Move stock ────────────────────────────────────────────────
+  if (activeModal === 'move') {
+    const s = stock.find(x => x.id === modalData.stockId);
+    if (!s) return '';
+    const p        = products.find(x => x.id === s.productId);
+    // FIX #4: otherLocs empty → show message instead of broken empty select
+    const otherLocs = locations.filter(l => l.id !== s.locationId);
+    if (otherLocs.length === 0) {
+      inner = `
+        ${modalHeader(esc(p?.name || '') + ' verschieben')}
+        <div style="padding:16px;background:${C.paperDark};border:1.5px solid ${C.ink};
+                    font-size:13px;color:${C.ink};margin-bottom:16px;">
+          Kein weiterer Ort vorhanden. Bitte zuerst einen zweiten Ort anlegen.
+        </div>
+        <button data-action="close-modal"
+          style="width:100%;padding:14px;background:${C.paperDark};border:2px solid ${C.ink};
+                 font-family:'Work Sans',sans-serif;font-size:12px;font-weight:700;
+                 letter-spacing:0.18em;text-transform:uppercase;cursor:pointer;color:${C.ink};">
+          Schließen
+        </button>`;
+    } else {
+      inner = `
+        ${modalHeader(esc(p?.name || '') + ' verschieben')}
+        <div style="display:flex;flex-direction:column;gap:14px;">
+          <div style="padding:12px 14px;background:${C.paperDark};border:1.5px solid ${C.ink};
+                      font-size:13px;font-weight:500;color:${C.ink};">
+            <span class="label" style="color:${C.inkSoft};margin-right:8px;">Von</span>
+            ${esc(locName(s.locationId))} · ${s.quantity} verfügbar
+          </div>
+          <select class="pub-input" id="move-to-loc">
+            ${otherLocs.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join('')}
+          </select>
+          <div>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+              <span class="label" style="color:${C.inkSoft};">Menge</span>
+              <input type="text" inputmode="numeric" id="move-amount" value="1"
+                style="width:76px;padding:6px 10px;border:2px solid ${C.ink};background:${C.paper};
+                       font-size:22px;font-family:'Bebas Neue',sans-serif;text-align:center;
+                       outline:none;color:${C.navy};">
+            </div>
+            <input type="range" id="move-amount-range" min="1" max="${s.quantity}" value="1">
+          </div>
+          ${primaryBtn('confirm-move', 'Verschieben')}
+        </div>`;
+    }
+  }
+
+  // ── Product detail ────────────────────────────────────────────
+  if (activeModal === 'product-detail') {
+    const p = products.find(x => x.id === modalData.productId);
+    if (!p) return '';
+    const ps  = getStockForProduct(p.id);
+    const tot = ps.reduce((s, x) => s + x.quantity, 0);
+    inner = `
+      ${modalHeader(esc(p.name))}
+      <div style="${p.imageUrl
+        ? `width:100%;height:180px;background:url('${esc(p.imageUrl)}') center/cover;border:2px solid ${C.brass};margin-bottom:16px;`
+        : `width:100%;height:180px;background:${C.navy};border:2px solid ${C.brass};margin-bottom:16px;display:flex;align-items:center;justify-content:center;font-family:'Bebas Neue',sans-serif;font-size:90px;color:${C.paper};line-height:1;`}">
+        ${p.imageUrl ? '' : esc(p.name.charAt(0))}
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:20px;">
+        <span class="label" style="color:${C.inkSoft};">${esc(p.type)}</span>
+        <div class="display" style="font-size:36px;color:${C.navy};line-height:1;">${tot}</div>
+      </div>
+      <div style="height:2px;background:${C.navy};margin-bottom:14px;"></div>
+      <div class="label" style="color:${C.ink};margin-bottom:12px;">Bestände</div>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:24px;">
+        ${ps.map(s => `
+          <div style="display:grid;grid-template-columns:14px 1fr auto;align-items:center;
+                      gap:10px;padding:10px 12px;background:${C.paperDark};border:1.5px solid ${C.ink};">
+            <span style="color:${locIsCold(s.locationId) ? C.navy : C.brassDark};font-size:11px;text-align:center;">
+              ${locIsCold(s.locationId) ? '◆' : '❖'}
+            </span>
+            <span style="font-family:'Work Sans',sans-serif;font-size:13px;font-weight:500;color:${C.ink};
+                         overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+              ${esc(locName(s.locationId))}
+            </span>
+            ${renderStockControls(s.id)}
+          </div>`).join('')}
+      </div>
+      <button data-action="delete-product"
+        style="width:100%;padding:12px;background:transparent;border:2px solid ${C.danger};
+               color:${C.danger};font-size:12px;font-weight:700;letter-spacing:0.18em;
+               text-transform:uppercase;cursor:pointer;font-family:'Work Sans',sans-serif;">
+        Produkt löschen
+      </button>`;
+  }
+
+  // ── Confirm delete location ───────────────────────────────────
+  if (activeModal === 'confirm-delete-location') {
+    const loc      = locations.find(l => l.id === modalData.locId);
+    if (!loc) return '';
+    const affected = stock.filter(s => s.locationId === loc.id).reduce((sum, s) => sum + s.quantity, 0);
+    inner = `
+      ${modalHeader('Ort löschen?')}
+      <div style="display:flex;gap:12px;padding:14px 16px;background:rgba(139,32,32,0.08);
+                  border:1.5px solid ${C.danger};margin-bottom:20px;align-items:flex-start;">
+        <span style="color:${C.danger};font-size:20px;flex-shrink:0;">⚠</span>
+        <div style="font-size:13px;color:${C.ink};line-height:1.5;">
+          <strong>${esc(loc.name)}</strong> wird gelöscht.
+          ${affected > 0 ? `<strong> ${affected} Flaschen</strong> an diesem Ort werden ebenfalls entfernt.` : ''}
+        </div>
+      </div>
+      <div class="label" style="color:${C.inkSoft};margin-bottom:8px;">Zur Bestätigung „LÖSCHEN" eingeben</div>
+      <input class="pub-input" id="confirm-delete-input" placeholder="LÖSCHEN" autofocus
+             style="margin-bottom:16px;font-weight:700;letter-spacing:0.1em;">
+      <div style="display:grid;grid-template-columns:1fr 1fr;border:2px solid ${C.ink};">
+        <button data-action="close-modal"
+          style="padding:14px;background:${C.paperDark};border:none;border-right:2px solid ${C.ink};
+                 font-family:'Work Sans',sans-serif;font-size:12px;font-weight:700;
+                 letter-spacing:0.18em;text-transform:uppercase;cursor:pointer;color:${C.ink};">
+          Abbrechen
+        </button>
+        <button id="confirm-delete-btn" data-action="confirm-delete-location" disabled
+          style="padding:14px;background:${C.disabled};color:${C.paper};border:none;
+                 font-family:'Work Sans',sans-serif;font-size:12px;font-weight:700;
+                 letter-spacing:0.18em;text-transform:uppercase;cursor:not-allowed;">
+          Löschen
+        </button>
+      </div>`;
+  }
+
+  if (!inner) return '';
+  return `
+  <div class="modal-overlay" id="modal-overlay">
+    <div class="modal-box">
+      <div class="paper-bg modal-inner">${inner}</div>
+    </div>
+  </div>`;
+}
+
+// ─── Main render ──────────────────────────────────────────────────
+function render() {
+  const appEl = document.getElementById('app');
+  if (!appEl) return;
+
+  // FIX #16: Fokus vor dem destruktiven innerHTML-Reset merken
+  const focusSnapshot = captureFocus();
+
+  const fp       = filteredProducts();
+  const colCount = Math.min(locations.length || 1, 3);
+
+  appEl.innerHTML = `
+  <div style="padding:20px 16px 140px;max-width:900px;margin:0 auto;">
+    <div style="background:linear-gradient(135deg,#3D2718 0%,#1A1410 100%);
+                box-shadow:inset 0 0 0 2px ${C.brassDark},inset 0 0 0 6px ${C.ink},
+                           inset 0 0 0 8px ${C.brass},0 12px 40px rgba(0,0,0,0.6);padding:12px;">
+      <div class="paper-bg" style="padding:32px 24px 40px;">
+
+        <!-- Header -->
+        <div style="text-align:center;margin-bottom:28px;">
+          <div class="label" style="color:${C.navy};margin-bottom:10px;">◆ Est. 2025 ◆</div>
+          <div style="display:inline-flex;align-items:stretch;margin-bottom:8px;">
+            <div style="background:${C.navy};color:${C.paper};padding:8px 18px;display:flex;align-items:center;">
+              <span class="display" style="font-size:52px;line-height:1;">The</span>
+            </div>
+            <div style="background:${C.ink};color:${C.paper};padding:8px 22px;display:flex;align-items:center;">
+              <span class="display" style="font-size:52px;line-height:1;">Cellar</span>
+            </div>
+          </div>
+          <div style="font-family:'Cormorant Garamond',serif;font-style:italic;font-size:17px;color:${C.navy};font-weight:500;">House Inventory</div>
+          <div style="display:flex;align-items:center;justify-content:center;gap:14px;margin-top:18px;">
+            <div style="height:2px;flex:1;max-width:120px;background:linear-gradient(90deg,transparent,${C.brass} 20%,${C.brass} 80%,transparent);"></div>
+            <span style="color:${C.navy};font-size:14px;">◆</span>
+            <div style="height:2px;flex:1;max-width:120px;background:linear-gradient(90deg,transparent,${C.brass} 20%,${C.brass} 80%,transparent);"></div>
+          </div>
+        </div>
+
+        <!-- Stats -->
+        <div style="display:flex;justify-content:space-around;padding:16px 0;border-top:2px solid ${C.navy};border-bottom:2px solid ${C.navy};margin-bottom:28px;background:rgba(27,42,78,0.03);">
+          <div style="text-align:center;flex:1;">
+            <div class="display" style="font-size:36px;color:${C.navy};margin-bottom:4px;">${products.length}</div>
+            <div class="label" style="color:${C.inkSoft};">Sorten</div>
+          </div>
+          <div style="width:1px;background:${C.lineSoft};opacity:0.5;"></div>
+          <div style="text-align:center;flex:1;">
+            <div class="display" style="font-size:36px;color:${C.navy};margin-bottom:4px;">${totalAll()}</div>
+            <div class="label" style="color:${C.inkSoft};">Flaschen</div>
+          </div>
+          <div style="width:1px;background:${C.lineSoft};opacity:0.5;"></div>
+          <div style="text-align:center;flex:1;">
+            <div class="display" style="font-size:36px;color:${C.navy};margin-bottom:4px;">${locations.length}</div>
+            <div class="label" style="color:${C.inkSoft};">Orte</div>
+          </div>
+        </div>
+
+        <!-- Search -->
+        <input class="pub-input" id="search-input" type="text" placeholder="Suchen…"
+               value="${esc(search)}" style="margin-bottom:14px;">
+
+        <!-- Filter tabs -->
+        <div style="display:flex;margin-bottom:32px;border:2px solid ${C.ink};background:${C.paperDark};">
+          ${[['all','Alle'],['cold','◆ Gekühlt'],['storage','❖ Lager']].map(([f, label], i) => {
+            const active = filter === f;
+            return `<button data-action="set-filter" data-filter="${f}"
+              style="flex:1;padding:14px 12px;background:${active ? C.navy : 'transparent'};
+                     color:${active ? C.paper : C.ink};border:none;
+                     ${i < 2 ? `border-right:2px solid ${C.ink};` : ''}
+                     font-family:'Work Sans',sans-serif;font-size:12px;font-weight:700;
+                     letter-spacing:0.15em;text-transform:uppercase;cursor:pointer;">
+              ${label}
+            </button>`;
+          }).join('')}
+        </div>
+
+        <!-- Locations -->
+        <div style="display:flex;align-items:center;gap:14px;margin-bottom:14px;">
+          <h2 class="display" style="font-size:28px;margin:0;color:${C.ink};line-height:1;">Die Orte</h2>
+          <div style="flex:1;height:1px;background:${C.ink};"></div>
+          <button data-action="open-add-location"
+            style="background:none;border:none;color:${C.navy};cursor:pointer;
+                   font-family:'Work Sans',sans-serif;font-size:10px;font-weight:700;
+                   letter-spacing:0.22em;text-transform:uppercase;padding:0;">+ Hinzufügen</button>
+        </div>
+
+        <div style="display:grid;grid-template-columns:repeat(${colCount},1fr);margin-bottom:36px;border:2px solid ${C.ink};">
+          ${locations.length === 0
+            ? `<div style="padding:24px;text-align:center;color:${C.inkSoft};font-size:13px;background:${C.paperDark};">Noch keine Orte angelegt</div>`
+            : locations.map((loc, i) => `
+              <div class="loc-card" style="${i < locations.length - 1 ? `border-right:2px solid ${C.ink};` : ''}">
+                <div class="label" style="color:${loc.isCold ? C.navy : C.brassDark};">
+                  ${loc.isCold ? '◆ Gekühlt' : '❖ Lager'}
+                </div>
+                <div style="font-family:'Work Sans',sans-serif;font-size:13px;font-weight:600;
+                            color:${C.ink};margin-top:8px;line-height:1.3;">${esc(loc.name)}</div>
+                <div class="display" style="font-size:40px;color:${C.navy};line-height:1;margin-top:8px;">${stockAtLoc(loc.id)}</div>
+                <button class="loc-del-btn" data-action="open-delete-location" data-lid="${loc.id}" aria-label="Ort löschen">×</button>
+              </div>`).join('')}
+        </div>
+
+        <!-- Products -->
+        <div style="display:flex;align-items:center;gap:14px;margin-bottom:14px;">
+          <h2 class="display" style="font-size:28px;margin:0;color:${C.ink};line-height:1;">Das Sortiment</h2>
+          <div style="flex:1;height:1px;background:${C.ink};"></div>
+        </div>
+
+        ${fp.length === 0
+          ? `<div style="padding:32px 20px;text-align:center;color:${C.inkSoft};font-size:14px;
+                         font-style:italic;font-family:'Cormorant Garamond',serif;
+                         border:1px dotted ${C.lineSoft};">Nichts gefunden.</div>`
+          : `<div>${fp.map(p => {
+              const vs    = visibleStock(p.id);
+              const total = vs.reduce((s, x) => s + x.quantity, 0);
+              return `
+              <div class="prod-row">
+                <div class="prod-initial" data-action="open-product-detail" data-pid="${p.id}"
+                     style="${p.imageUrl ? `background:url('${esc(p.imageUrl)}') center/cover no-repeat;` : `background:${C.navy};`}">
+                  ${p.imageUrl ? '' : esc(p.name.charAt(0))}
+                </div>
+                <div style="flex:1;min-width:0;">
+                  <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:4px;cursor:pointer;"
+                       data-action="open-product-detail" data-pid="${p.id}">
+                    <h3 class="display" style="font-size:22px;margin:0;color:${C.ink};line-height:1.1;
+                                               overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%;">
+                      ${esc(p.name)}
+                    </h3>
+                    <div style="flex:1;border-bottom:1px dotted ${C.lineSoft};transform:translateY(-4px);min-width:8px;"></div>
+                    <span class="display" style="font-size:26px;color:${C.navy};line-height:1;flex-shrink:0;">${total}</span>
+                  </div>
+                  <div class="label" style="color:${C.inkSoft};margin-bottom:12px;">${esc(p.type)}</div>
+                  <div style="display:flex;flex-direction:column;gap:8px;">
+                    ${vs.map(s => `
+                      <div style="display:grid;grid-template-columns:14px 1fr auto;align-items:center;gap:8px;padding-left:4px;">
+                        <span style="color:${locIsCold(s.locationId) ? C.navy : C.brassDark};font-size:11px;text-align:center;">
+                          ${locIsCold(s.locationId) ? '◆' : '❖'}
+                        </span>
+                        <span style="font-family:'Work Sans',sans-serif;font-size:13px;color:${C.ink};font-weight:500;
+                                     overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                          ${esc(locName(s.locationId))}
+                        </span>
+                        ${renderStockControls(s.id)}
+                      </div>`).join('')}
+                  </div>
+                </div>
+              </div>`;
+            }).join('')}</div>`}
+
+        <!-- Footer -->
+        <div style="margin-top:36px;padding-top:20px;border-top:2px solid ${C.navy};text-align:center;">
+          <div class="label" style="color:${C.navy};">◆ Cheers & Prost ◆</div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- FAB -->
+  <button class="fab" data-action="open-add-product" aria-label="Produkt hinzufügen">+</button>
+
+  <!-- Modal -->
+  ${renderModal()}
+  `;
+
+  // FIX #16: Fokus + Cursor-Position wiederherstellen, damit Tippen im
+  // Suchfeld (und anderen Inputs) die Tastatur nicht schließt.
+  restoreFocus(focusSnapshot);
+}
+
+// ─── Single click handler (FIX #6: was duplicated across two listeners) ──
+document.addEventListener('click', async (e) => {
+  // FIX #7: modal overlay close — only when clicking the backdrop itself
+  const overlay = document.getElementById('modal-overlay');
+  if (overlay && e.target === overlay) { closeModal(); return; }
+
+  const t = e.target.closest('[data-action]');
+  if (!t) return;
+  const action = t.dataset.action;
+
+  switch (action) {
+    case 'close-modal':            closeModal(); break;
+    case 'open-add-location':      openModal('add-location'); break;
+    case 'open-add-product':       openModal('add-product'); break;
+    case 'open-product-detail':    openModal('product-detail', { productId: t.dataset.pid }); break;
+    case 'open-move':              openModal('move', { stockId: t.dataset.sid }); break;
+    case 'open-delete-location':   openModal('confirm-delete-location', { locId: t.dataset.lid }); break;
+    case 'set-filter':             filter = t.dataset.filter; render(); break;
+    case 'increment':              await changeStock(t.dataset.sid, 1); break;
+    case 'decrement':              await changeStock(t.dataset.sid, -1); break;
+    case 'start-scan':             startScanner(); break;
+    case 'stop-scan':              stopScanner(); break;
+
+    case 'toggle-cold': {
+      // FIX #3: toggle state is now a module variable, no DOM nesting issues
+      locColdState = !locColdState;
+      const toggleEl = document.getElementById('loc-cold-toggle');
+      if (toggleEl) toggleEl.outerHTML = renderToggleHTML(locColdState);
+      break;
+    }
+
+    case 'confirm-add-location': {
+      const name = document.getElementById('loc-name')?.value.trim();
+      if (!name) return;
+      await addLocation(name, locColdState);
+      closeModal();
+      break;
+    }
+
+    case 'confirm-add-product': {
+      const name   = document.getElementById('add-name')?.value.trim();
+      const type   = document.getElementById('add-type')?.value;
+      const locId  = document.getElementById('add-loc')?.value;
+      const qty    = parseInt(document.getElementById('add-qty')?.value) || 1;
+      const imgEl  = document.getElementById('preview-img');
+      if (!name) return;
+      // FIX #5: only store imageUrl when it's a remote URL (from UPCitemdb).
+      // Local base64 blobs from file upload stay in the preview only (session).
+      const isRemoteUrl = imgEl && imgEl.style.display !== 'none' && imgEl.src.startsWith('http');
+      const imageUrl    = isRemoteUrl ? imgEl.src : null;
+      const pid = await addProduct(name, type, imageUrl, barcodeValue || null);
+      if (pid) { await addStock(pid, locId, qty); closeModal(); }
+      break;
+    }
+
+    case 'confirm-move': {
+      const toLocId = document.getElementById('move-to-loc')?.value;
+      const amount  = parseInt(document.getElementById('move-amount')?.value) || 1;
+      if (!toLocId) return;
+      await moveStock(modalData.stockId, toLocId, amount);
+      closeModal();
+      break;
+    }
+
+    case 'delete-product': {
+      await deleteProduct(modalData.productId);
+      closeModal();
+      break;
+    }
+
+    case 'confirm-delete-location': {
+      const btn = document.getElementById('confirm-delete-btn');
+      if (btn?.disabled) return;
+      await deleteLocation(modalData.locId);
+      closeModal();
+      break;
+    }
+  }
+});
+
+// ─── Single input handler ─────────────────────────────────────────
+document.addEventListener('input', (e) => {
+  const id = e.target.id;
+
+  if (id === 'search-input') {
+    search = e.target.value;
+    render();
+    return;
+  }
+  if (id === 'move-amount-range') {
+    const v = parseInt(e.target.value);
+    const numEl = document.getElementById('move-amount');
+    if (numEl) numEl.value = v;
+    return;
+  }
+  if (id === 'move-amount') {
+    const rangeEl = document.getElementById('move-amount-range');
+    if (!rangeEl) return;
+    const max = parseInt(rangeEl.max);
+    let v = parseInt(e.target.value.replace(/[^0-9]/g, '')) || 1;
+    v = Math.min(max, Math.max(1, v));
+    rangeEl.value     = v;
+    e.target.value    = v;
+    return;
+  }
+  if (id === 'add-qty') {
+    let v = e.target.value.replace(/[^0-9]/g, '');
+    if (v !== '') v = String(Math.max(1, parseInt(v)));
+    e.target.value = v;
+    return;
+  }
+  if (id === 'confirm-delete-input') {
+    const btn   = document.getElementById('confirm-delete-btn');
+    if (!btn) return;
+    const valid = e.target.value.trim().toUpperCase() === 'LÖSCHEN';
+    btn.disabled        = !valid;
+    btn.style.background = valid ? C.danger : C.disabled;
+    btn.style.cursor     = valid ? 'pointer' : 'not-allowed';
+    return;
+  }
+});
+
+// ─── Photo upload ─────────────────────────────────────────────────
+document.addEventListener('change', (e) => {
+  if (e.target.id !== 'photo-upload') return;
+  const file = e.target.files?.[0];
+  if (!file) return;
+  // FIX #5: Warn if file is too large for Firestore (we won't store it, but preview works)
+  if (file.size > 800_000) {
+    setScanStatus('Foto nur als Vorschau – zu groß für Cloud-Speicher', C.brassDark);
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    const img = document.getElementById('preview-img');
+    const ph  = document.getElementById('preview-placeholder');
+    if (img) { img.src = reader.result; img.style.display = 'block'; }
+    if (ph)  ph.style.display = 'none';
+  };
+  reader.readAsDataURL(file);
+});
+</script>
+</body>
+</html>
