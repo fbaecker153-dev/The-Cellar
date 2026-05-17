@@ -107,6 +107,9 @@
 <script type="module">
 import { initializeApp }   from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
 import {
+  getAuth, signInWithEmailAndPassword, onAuthStateChanged
+} from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
+import {
   getFirestore, collection, doc,
   onSnapshot, addDoc, updateDoc, deleteDoc,
   runTransaction
@@ -121,7 +124,8 @@ const app = initializeApp({
   messagingSenderId: "563417876719",
   appId:             "1:563417876719:web:c6e5dd74b017311e8fb31a"
 });
-const db = getFirestore(app);
+const auth = getAuth(app);
+const db   = getFirestore(app);
 
 // ─── Design tokens (used in JS-generated HTML) ────────────────────
 const C = {
@@ -130,6 +134,110 @@ const C = {
   brass:       '#A8842F', brassDark:  '#6F5621', navy:       '#1B2A4E',
   danger:      '#8B2020', lineSoft:   '#8B7559', disabled:   '#B8AB8E',
 };
+
+// ─── PIN Screen ───────────────────────────────────────────────────
+const PIN_EMAIL    = 'admin@cellar.local';
+const PIN_PASSWORD = '15031986';
+
+function showPinScreen(errorMsg = '') {
+  const appEl = document.getElementById('app');
+  appEl.innerHTML = `
+  <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;
+              background:#1A1410;padding:24px;">
+    <div style="width:100%;max-width:340px;">
+
+      <!-- Logo -->
+      <div style="text-align:center;margin-bottom:40px;">
+        <div style="display:inline-flex;align-items:stretch;margin-bottom:8px;">
+          <div style="background:#1B2A4E;color:#F2E8D5;padding:6px 16px;display:flex;align-items:center;">
+            <span style="font-family:'Bebas Neue',sans-serif;font-size:42px;line-height:1;">The</span>
+          </div>
+          <div style="background:#1C1814;color:#F2E8D5;padding:6px 18px;display:flex;align-items:center;">
+            <span style="font-family:'Bebas Neue',sans-serif;font-size:42px;line-height:1;">Cellar</span>
+          </div>
+        </div>
+        <div style="font-family:'Cormorant Garamond',serif;font-style:italic;font-size:15px;
+                    color:#A8842F;margin-top:4px;">House Inventory</div>
+      </div>
+
+      <!-- PIN display -->
+      <div id="pin-display"
+           style="font-family:'Bebas Neue',sans-serif;font-size:48px;letter-spacing:0.25em;
+                  text-align:center;color:#F2E8D5;min-height:64px;margin-bottom:8px;
+                  background:#1C1814;border:2px solid #A8842F;padding:10px 20px;">
+        &nbsp;
+      </div>
+
+      <!-- Error -->
+      <div id="pin-error"
+           style="text-align:center;font-family:'Work Sans',sans-serif;font-size:12px;
+                  font-weight:700;letter-spacing:0.1em;color:#8B2020;min-height:20px;
+                  margin-bottom:16px;">
+        ${errorMsg}
+      </div>
+
+      <!-- Numpad -->
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;">
+        ${[1,2,3,4,5,6,7,8,9,'','0','⌫'].map(k => `
+          <button data-pin-key="${k}"
+            style="padding:20px 0;background:${k === '' ? 'transparent' : '#2A1F18'};
+                   border:${k === '' ? 'none' : '1.5px solid #3D2E24'};
+                   color:#F2E8D5;font-family:'Work Sans',sans-serif;font-size:22px;
+                   font-weight:600;cursor:${k === '' ? 'default' : 'pointer'};
+                   border-radius:0;-webkit-tap-highlight-color:transparent;
+                   transition:background 0.1s;"
+            ${k === '' ? 'disabled' : ''}
+            onpointerdown="this.style.background='${k === '' ? 'transparent' : '#A8842F'}'"
+            onpointerup="this.style.background='${k === '' ? 'transparent' : '#2A1F18'}'"
+            onpointerleave="this.style.background='${k === '' ? 'transparent' : '#2A1F18'}'">
+            ${k}
+          </button>`).join('')}
+      </div>
+
+    </div>
+  </div>`;
+
+  // PIN-Logik
+  let pin = '';
+
+  function updateDisplay() {
+    const el = document.getElementById('pin-display');
+    if (el) el.textContent = pin ? '●'.repeat(pin.length) : '\u00a0';
+  }
+
+  async function submitPin() {
+    if (pin.length < 4) return;
+    const errEl = document.getElementById('pin-error');
+    if (errEl) errEl.textContent = '';
+    try {
+      await signInWithEmailAndPassword(auth, PIN_EMAIL, pin);
+      // onAuthStateChanged übernimmt ab hier
+    } catch(e) {
+      pin = '';
+      updateDisplay();
+      if (errEl) errEl.textContent = 'Falscher Code';
+    }
+  }
+
+  document.querySelectorAll('[data-pin-key]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const k = btn.dataset.pinKey;
+      if (k === '') return;
+      if (k === '⌫') {
+        pin = pin.slice(0, -1);
+        updateDisplay();
+        return;
+      }
+      if (pin.length >= 12) return;
+      pin += k;
+      updateDisplay();
+      // Auto-submit sobald der Code lang genug ist (8 Stellen)
+      if (pin.length === PIN_PASSWORD.length) {
+        await submitPin();
+      }
+    });
+  });
+}
 
 // ─── App state ────────────────────────────────────────────────────
 let locations = [];
@@ -155,21 +263,62 @@ function scheduleRender() {
   requestAnimationFrame(() => { renderScheduled = false; render(); });
 }
 
-// ─── Firestore listeners ──────────────────────────────────────────
-onSnapshot(collection(db, 'locations'), snap => {
-  locations = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-  snapshotReady.locations = true;
-  scheduleRender();
-});
-onSnapshot(collection(db, 'products'), snap => {
-  products = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-  snapshotReady.products = true;
-  scheduleRender();
-});
-onSnapshot(collection(db, 'stock'), snap => {
-  stock = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-  snapshotReady.stock = true;
-  scheduleRender();
+// FIX #16: Fokus-Erhaltung über Re-Renders hinweg.
+// Problem: Jeder Tastendruck im Suchfeld triggert render() → innerHTML wird
+// komplett neu geschrieben → Input-Element wird zerstört → Fokus weg →
+// mobile Tastatur klappt zu. Lösung: Vor render() merken wir uns, welches
+// Eingabefeld den Fokus hatte (+ Cursor-Position), nach render() stellen
+// wir das wieder her.
+function captureFocus() {
+  const el = document.activeElement;
+  if (!el || !el.id) return null;
+  // Nur für relevante Eingabefelder (vermeidet versehentliches Fokussieren von Buttons o.ä.)
+  if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') return null;
+  return {
+    id: el.id,
+    start: el.selectionStart,
+    end: el.selectionEnd,
+  };
+}
+function restoreFocus(snapshot) {
+  if (!snapshot) return;
+  const el = document.getElementById(snapshot.id);
+  if (!el) return;
+  el.focus();
+  // selectionStart/End nur bei text-like Inputs setzen, sonst wirft es bei z.B. type=range
+  try {
+    if (snapshot.start != null && el.setSelectionRange) {
+      el.setSelectionRange(snapshot.start, snapshot.end);
+    }
+  } catch(_) { /* manche Input-Typen unterstützen das nicht */ }
+}
+
+// ─── Firestore listeners (nur nach Login) ─────────────────────────
+function startApp() {
+  onSnapshot(collection(db, 'locations'), snap => {
+    locations = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    snapshotReady.locations = true;
+    scheduleRender();
+  });
+  onSnapshot(collection(db, 'products'), snap => {
+    products = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    snapshotReady.products = true;
+    scheduleRender();
+  });
+  onSnapshot(collection(db, 'stock'), snap => {
+    stock = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    snapshotReady.stock = true;
+    scheduleRender();
+  });
+}
+
+// ─── Auth gate ────────────────────────────────────────────────────
+onAuthStateChanged(auth, user => {
+  if (user) {
+    startApp();
+  } else {
+    showPinScreen();
+  }
 });
 
 // ─── Error toast ──────────────────────────────────────────────────
@@ -684,6 +833,9 @@ function render() {
   const appEl = document.getElementById('app');
   if (!appEl) return;
 
+  // FIX #16: Fokus vor dem destruktiven innerHTML-Reset merken
+  const focusSnapshot = captureFocus();
+
   const fp       = filteredProducts();
   const colCount = Math.min(locations.length || 1, 3);
 
@@ -737,7 +889,7 @@ function render() {
 
         <!-- Filter tabs -->
         <div style="display:flex;margin-bottom:32px;border:2px solid ${C.ink};background:${C.paperDark};">
-          ${[['all','Alle'],['cold','◆ Gekühlt'],['storage','❖ Im Keller']].map(([f, label], i) => {
+          ${[['all','Alle'],['cold','◆ Gekühlt'],['storage','❖ Lager']].map(([f, label], i) => {
             const active = filter === f;
             return `<button data-action="set-filter" data-filter="${f}"
               style="flex:1;padding:14px 12px;background:${active ? C.navy : 'transparent'};
@@ -837,6 +989,10 @@ function render() {
   <!-- Modal -->
   ${renderModal()}
   `;
+
+  // FIX #16: Fokus + Cursor-Position wiederherstellen, damit Tippen im
+  // Suchfeld (und anderen Inputs) die Tastatur nicht schließt.
+  restoreFocus(focusSnapshot);
 }
 
 // ─── Single click handler (FIX #6: was duplicated across two listeners) ──
